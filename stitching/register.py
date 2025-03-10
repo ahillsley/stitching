@@ -1,11 +1,4 @@
 import dexp
-
-
-# Given 2 fovs, use dexp to estimate the shift between them
-
-
-#%%
-import dexp
 from dexp.processing.registration.model.translation_registration_model import TranslationRegistrationModel
 from dexp.processing.registration import translation_nd as dexp_reg
 import numpy as np
