@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stitch"
+version = "0.1"
+description = "stitching of multi-fov microscopy datasets"
+
+authors = [
+    { name = "Alex Hillsley", email = "alexander.hillsley@czbiohub.org" },
+]
+#TODO: add dependencies
+dependencies = [
+    
+]
+
+# Hatch config
+[tool.hatch.build.targets.wheel]
+packages = ["stitch"]
