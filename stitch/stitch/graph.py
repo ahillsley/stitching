@@ -1,18 +1,25 @@
 import numpy as np
 
-def connectivity(points: np.array) -> np.array:
+
+def connectivity(points: np.array) -> dict:
     """
     provided a list of points, get the connectivity graph between neighboring points
+    - preserves the order of points
+        - i.e. if fed in in hilbert curve order, will return the edges in hilbert list order
     """
     point_set = set(map(tuple, points))
-    edges = set()
+    edges = dict()
+    edge_inx = 0
     directions = np.array([(0, 1), (1, 0)])
     for x, y in points:
         for dx, dy in directions:
             neighbor = (x + dx, y + dy)
             if neighbor in point_set:
-                edges.add(tuple(sorted([(x, y), neighbor])))
+                edges[f"{edge_inx}"] = [(x, y), neighbor]
+                edge_inx += 1
+                # edges.add(tuple(sorted([(x, y), neighbor])))
     return edges
+
 
 def hilbert_index_to_xy(n, d):
     """Convert a 1D Hilbert index to 2D coordinates in an n x n grid."""
@@ -32,6 +39,7 @@ def hilbert_index_to_xy(n, d):
         s *= 2
     return np.asarray([x, y])
 
+
 def generate_hilbert_curve(n):
     """Generate the Hilbert curve order for an n x n grid.
     Only fills the entire grid if n is a power of 2
@@ -41,3 +49,17 @@ def generate_hilbert_curve(n):
         order.append(hilbert_index_to_xy(n, i))
     return np.asarray(order)
 
+
+def hilbert_over_points(points: np.array) -> np.array:
+    """
+    Given a set of points, return the Hilbert curve order of the points
+    """
+    n = int(np.max(points) + 1)
+    n_full_curve = 1 if n == 0 else 1 << (n - 1).bit_length()
+    hilbert_curve = generate_hilbert_curve(n_full_curve)
+
+    order = []
+    for p in hilbert_curve:
+        if np.any(np.all(points == p, axis=1)):
+            order.append(p)
+    return np.asarray(order)
