@@ -22,7 +22,7 @@ def example_tiles(
             j_start = np.clip(j * j_stride + j_shift, a_min=0, a_max=width)
             j_end = np.clip(j_start + tile_width, a_min=0, a_max=width)
 
-            print(f"{i_start}, {i_end}, {j_start}, {j_end}")
+            # print(f"{i_start}, {i_end}, {j_start}, {j_end}")
 
             tiles.append(img[i_start:i_end, j_start:j_end])
 
