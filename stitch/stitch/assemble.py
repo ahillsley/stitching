@@ -44,13 +44,11 @@ def assemble(
     """
 
     final_shape_xy = get_output_shape(shifts, tile_size)
-    print(f"final shape  xy is: {final_shape_xy}")
     fov_store = open_ome_zarr(fov_store_path)
     pos_1 = next(fov_store.positions())[0]
 
     tile_shape = fov_store[pos_1].data.shape
     final_shape = tile_shape[:3] + final_shape_xy
-    print(final_shape)
     output_image = xp.zeros(final_shape, dtype=xp.float16)  # check dtype
     divisor = xp.zeros(final_shape, dtype=xp.uint8)
 
@@ -133,7 +131,6 @@ def stitch(
     # call assemble for each well
     for g in grouped_shifts.keys():
         shifts = grouped_shifts[g]
-        print("entering assemble")
         output = assemble(
             shifts=shifts,
             tile_size=tile_shape[-2:],
@@ -142,9 +139,7 @@ def stitch(
             fliplr=fliplr,
             rot90=rot90,
         )
-        print("completed output")
         stitched_pos = output_store.create_position("A", g, "0")
-        print("created position")
         stitched_pos.create_image(
             "0",
             data=output,
