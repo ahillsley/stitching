@@ -142,30 +142,9 @@ def offset(
         corr_x = 0
         corr_y = shape[-1] - overlap
 
-    # Currently edges only exist to the right and below
-    # This is by desgin when we construct the graph
-    # however leave this here for future use
-    # Caution: not tested yet
-    # if relation[0] == 1:
-    # # tile_b is to the left of tile_a
-    # roi_a = image_a[:, overlap:]
-    # roi_b = image_b[:, -overlap]
-    # corr_x = overlap - shape[2]
-    # corr_y = 0
-    # sign_flipper = np.asarray([1, 1])
-    # if relation[1] == 1:
-    #     # tile_b is above tile_a
-    #     roi_a = image_a[-overlap:, :]
-    #     roi_b = image_b[:overlap, :]
-    #     corr_x = 0
-    #     corr_y =  overlap - shape[1]
-    #     sign_flipper = np.asarray([1, 1])s
-
     model = dexp_reg.register_translation_nd(roi_a, roi_b)
     # print(f"model shift vector is: {model.shift_vector}")
-    model.shift_vector += np.array(
-        [corr_y, corr_x]
-    )  # add the correction to the shift vector
+    model.shift_vector += np.array([corr_y, corr_x])
 
     return model
 
@@ -225,11 +204,12 @@ def optimal_positions(edge_list: List, tile_lut: Dict, well: str) -> Dict:
     a[0, -1] = 1
 
     a = a.T.tocsr()
-    tolerance = 1e-6
+    tolerance = 1e-5
     order_error = 1
     order_reg = 1
     alpha_reg = 0
-
+    maxiter = 1e8
+    print("optimizing positions")
     opt_i = linsolve(
         a,
         y_i,
@@ -238,6 +218,7 @@ def optimal_positions(edge_list: List, tile_lut: Dict, well: str) -> Dict:
         order_reg=order_reg,
         alpha_reg=alpha_reg,
         x0=x_guess,
+        maxiter=maxiter,
     )
     opt_j = linsolve(
         a,
@@ -247,6 +228,7 @@ def optimal_positions(edge_list: List, tile_lut: Dict, well: str) -> Dict:
         order_reg=order_reg,
         alpha_reg=alpha_reg,
         x0=x_guess,
+        maxiter=maxiter,
     )
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
