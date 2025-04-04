@@ -142,6 +142,14 @@ def offset(
         corr_x = 0
         corr_y = shape[-1] - overlap
 
+    # phase images are centered at 0, shift to make them all positive
+    roi_a_min = np.min(roi_a)
+    roi_b_min = np.min(roi_b)
+    if roi_a_min < 0:
+        roi_a = roi_a - roi_a_min
+    if roi_b_min < 0:
+        roi_b = roi_b - roi_b_min
+
     model = dexp_reg.register_translation_nd(roi_a, roi_b)
     # print(f"model shift vector is: {model.shift_vector}")
     model.shift_vector += np.array([corr_y, corr_x])
@@ -185,12 +193,16 @@ def pairwise_shifts(
     return edge_list, confidence_dict
 
 
-def optimal_positions(edge_list: List, tile_lut: Dict, well: str) -> Dict:
+def optimal_positions(
+    edge_list: List, tile_lut: Dict, well: str, tile_size: tuple
+) -> Dict:
     """ """
     y_i = np.zeros(len(edge_list) + 1, dtype=np.float32)
     y_j = np.zeros(len(edge_list) + 1, dtype=np.float32)
 
-    x_guess = np.asarray([int(a[:3]) * 2048 for a in tile_lut.keys()])
+    x_guess = np.asarray(
+        [int(a[:3]) * tile_size[0] for a in tile_lut.keys()]
+    )  # assumes square tiles
 
     a = scipy.sparse.lil_matrix((len(tile_lut), len(edge_list) + 1), dtype=np.float32)
 
