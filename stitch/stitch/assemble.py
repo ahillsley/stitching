@@ -161,6 +161,7 @@ def estimate_stitch(
     flipud: bool,
     fliplr: bool,
     rot90: int,
+    tile_size: tuple=(2048,2048),
 ):
     """Mimic of Biahub estimate stitch function"""
 
@@ -187,7 +188,7 @@ def estimate_stitch(
             rot90=rot90,
         )
 
-        opt_shift_dict = optimal_positions(edge_list, tile_lut, g)
+        opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size)
 
         running_opt_shift_dict = running_opt_shift_dict | opt_shift_dict
         running_confidence_dict[g] = confidence_dict
