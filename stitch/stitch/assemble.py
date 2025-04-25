@@ -75,7 +75,8 @@ def assemble(
             :,
             shift_array[0] : shift_array[0] + tile_size[0],
             shift_array[1] : shift_array[1] + tile_size[1],
-        ] += 1
+        ] += (
+            tile[:,:,:,:,:] > 0)*1 #only add divisor where the tile is not zero
 
     stitched = xp.zeros_like(output_image, dtype=xp.float16)
 
