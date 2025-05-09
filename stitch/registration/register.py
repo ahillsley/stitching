@@ -71,7 +71,7 @@ def apply_affine_ome_zarr(array, transform, target_shape) -> np.array:
     xp_transform = xp.asarray(transform)
 
     transformed = cundi.affine_transform(
-        xp_array, xp_transform, order=1, output_shape=target_shape
+        xp_array, xp_transform, order=0, output_shape=target_shape
     )
 
     return transformed
