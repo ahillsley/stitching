@@ -11,8 +11,9 @@ authors = [
     { name = "Alex Hillsley", email = "alexander.hillsley@czbiohub.org" },
 ]
 #TODO: add dependencies
-[project.dependencies]
-
+dependencies = [
+    "dexp==2023.4.10.686",
+]
 
 # Hatch config
 [tool.hatch.build.targets.wheel]
