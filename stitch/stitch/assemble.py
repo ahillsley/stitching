@@ -10,6 +10,7 @@ from numpy.typing import ArrayLike
 from itertools import product
 import yaml
 from pathlib import Path
+import numpy as np
 
 import numpy as xp
 from scipy import ndimage as cundi
@@ -163,6 +164,8 @@ def estimate_stitch(
     fliplr: bool,
     rot90: int,
     tile_size: tuple=(2048,2048),
+    overlap: int = 150,
+    x_guess: Optional[dict] = None,
 ):
     """Mimic of Biahub estimate stitch function"""
 
@@ -187,9 +190,10 @@ def estimate_stitch(
             flipud=flipud,
             fliplr=fliplr,
             rot90=rot90,
+            overlap=overlap,
         )
 
-        opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size)
+        opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size, x_guess)
 
         running_opt_shift_dict = running_opt_shift_dict | opt_shift_dict
         running_confidence_dict[g] = confidence_dict

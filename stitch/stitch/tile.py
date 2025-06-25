@@ -36,8 +36,9 @@ class Edge:
     tile_cache: TileCache
     """
 
-    def __init__(self, tile_a_key, tile_b_key, tile_cache):
+    def __init__(self, tile_a_key, tile_b_key, tile_cache, overlap=150):
         self.tile_cache = tile_cache
+        self.overlap = overlap
         self.tile_a = connect.pos_to_name(tile_a_key)
         self.tile_b = connect.pos_to_name(tile_b_key)
         self.ux = int(self.tile_a[:3])
@@ -46,6 +47,7 @@ class Edge:
         self.vy = int(self.tile_b[3:])
         self.relation = (self.ux - self.vx, self.uy - self.vy)
         self.model = self.get_offset()
+        
 
     def get_offset(self):
         """
@@ -53,7 +55,7 @@ class Edge:
         """
         tile_a = self.tile_cache[self.tile_a]
         tile_b = self.tile_cache[self.tile_b]
-        return offset(tile_a, tile_b, self.relation, overlap=150)
+        return offset(tile_a, tile_b, self.relation, overlap=self.overlap)
 
 
 class TileCache:
@@ -99,7 +101,7 @@ class TileCache:
         da_tile = da.from_array(self.store[f"{self.well}/{key}"].data)
 
         aug_tile = augment_tile(
-            da_tile[0, 0, 0, :, :].compute(),
+            da_tile[0, 3, 100, :, :].compute(), #TODO: hardcoded to 2D # TODO: changed to 100!
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
@@ -152,13 +154,13 @@ def offset(
 
     model = dexp_reg.register_translation_nd(roi_a, roi_b)
     # print(f"model shift vector is: {model.shift_vector}")
-    model.shift_vector += np.array([corr_y, corr_x])
+    model.shift_vector += np.array([corr_y, corr_x]) # Pre-end 0 to extend to 3D
 
     return model
 
 
 def pairwise_shifts(
-    positions: List, store_path: str, well: str, flipud: bool, fliplr: bool, rot90: bool
+    positions: List, store_path: str, well: str, flipud: bool, fliplr: bool, rot90: bool, overlap: int = 150
 ) -> List:
     """ """
     # get neighboring tiles
@@ -178,7 +180,7 @@ def pairwise_shifts(
     edge_list = []
     confidence_dict = {}
     for key, pos in tqdm(edges_hilbert.items()):
-        edge_model = Edge(pos[0], pos[1], tile_cache)
+        edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
         edge_list.append(edge_model)
 
         # positions need to be not np.types to save to yaml
@@ -194,15 +196,23 @@ def pairwise_shifts(
 
 
 def optimal_positions(
-    edge_list: List, tile_lut: Dict, well: str, tile_size: tuple
+    edge_list: List, tile_lut: Dict, well: str, tile_size: tuple, initial_guess: dict = None
 ) -> Dict:
     """ """
     y_i = np.zeros(len(edge_list) + 1, dtype=np.float32)
     y_j = np.zeros(len(edge_list) + 1, dtype=np.float32)
 
-    x_guess = np.asarray(
-        [int(a[:3]) * tile_size[0] for a in tile_lut.keys()]
-    )  # assumes square tiles
+    if initial_guess is None:
+        i_guess = np.asarray(
+            [int(a[:3]) * tile_size[0] for a in tile_lut.keys()]
+        )  # assumes square tiles
+        j_guess = i_guess
+    else:
+        try:
+            i_guess = initial_guess[well]["i"]
+            j_guess = initial_guess[well]["j"]
+        except KeyError:
+            " initial guess not formatted correctly"
 
     a = scipy.sparse.lil_matrix((len(tile_lut), len(edge_list) + 1), dtype=np.float32)
 
@@ -229,7 +239,7 @@ def optimal_positions(
         order_error=order_error,
         order_reg=order_reg,
         alpha_reg=alpha_reg,
-        x0=x_guess,
+        x0=i_guess,
         maxiter=maxiter,
     )
     opt_j = linsolve(
@@ -239,7 +249,7 @@ def optimal_positions(
         order_error=order_error,
         order_reg=order_reg,
         alpha_reg=alpha_reg,
-        x0=x_guess,
+        x0=j_guess,
         maxiter=maxiter,
     )
     opt_shifts = np.vstack((opt_i, opt_j)).T
