@@ -12,7 +12,7 @@ authors = [
 ]
 #TODO: add dependencies
 dependencies = [
-    
+    "dexp==2023.4.10.686",
 ]
 
 # Hatch config
