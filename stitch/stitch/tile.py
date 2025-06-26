@@ -69,13 +69,15 @@ class TileCache:
     - get_item
     """
 
-    def __init__(self, store_path, well, flipud, fliplr, rot90):
+    def __init__(self, store_path, well, flipud, fliplr, rot90, channel_index=0, z_index=0):
         self.cache = LimitedSizeDict(max_size=20)
         self.store = open_ome_zarr(store_path)
         self.well = well
         self.flipud = flipud
         self.fliplr = fliplr
         self.rot90 = rot90
+        self.channel_index = channel_index
+        self.z_index = z_index
 
     def add(self, obj):
         """add an object to the cache"""
@@ -101,7 +103,7 @@ class TileCache:
         da_tile = da.from_array(self.store[f"{self.well}/{key}"].data)
 
         aug_tile = augment_tile(
-            da_tile[0, 3, 100, :, :].compute(), #TODO: hardcoded to 2D # TODO: changed to 100!
+            da_tile[0, self.channel_index, self.z_index, :, :].compute(), #TODO: hardcoded to 2D
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
@@ -160,7 +162,15 @@ def offset(
 
 
 def pairwise_shifts(
-    positions: List, store_path: str, well: str, flipud: bool, fliplr: bool, rot90: bool, overlap: int = 150
+    positions: List,
+    store_path: str,
+    well: str,
+    flipud: bool,
+    fliplr: bool,
+    rot90: bool,
+    overlap: int = 150,
+    channel_index: int = 0,
+    z_index: int = 0,
 ) -> List:
     """ """
     # get neighboring tiles
@@ -174,6 +184,8 @@ def pairwise_shifts(
         flipud=flipud,
         fliplr=fliplr,
         rot90=rot90,
+        channel_index=channel_index,
+        z_index=z_index,
     )
 
     edge_list = []
