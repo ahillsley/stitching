@@ -8,7 +8,7 @@ def parse_positions(fovs: list) -> np.array:
     """
     fov_positions = []
     for p in fovs:
-        p = p.split('/')[-1] # handle positions either with row/column info or without
+        p = p.split("/")[-1]  # handle positions either with row/column info or without
         x_cord = int(p[:3])
         y_cord = int(p[3:])
         fov_positions.append((x_cord, y_cord))
