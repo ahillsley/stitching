@@ -311,8 +311,8 @@ def assemble(
                 xs:xe,
             ] += w_masked
         else:
-        # Legacy simple averaging by counts: track how many non-zero contributions
-        # each pixel received, to divide the sum at the end.
+            # Legacy simple averaging by counts: track how many non-zero contributions
+            # each pixel received, to divide the sum at the end.
             output_image[
                 0:t_end,
                 0:c_end,
@@ -376,7 +376,6 @@ def assemble_streaming(
     scale: Optional[Tuple[float, float, float, float, float]] = None,
     divide_tile_size: Optional[Tuple[int, int]] = (1024, 1024),
     debug_zero_mask: bool = True,
-
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -483,6 +482,7 @@ def assemble_streaming(
     # Blockwise accumulation over YX: iterate over output in manageable strips/tiles
     ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
     total_y, total_x = final_shape[-2], final_shape[-1]
+
     def _process_y_band(y0: int, y1: int):
         # Preload tiles intersecting this Y band once; reuse across all X blocks
         y_tiles = [
@@ -505,12 +505,16 @@ def assemble_streaming(
             )
 
         # Dict for quick contributor filtering per X block
-        y_extents = {nm: (ys, ye, xs, xe) for (nm, _t, _c, _z, ys, ye, xs, xe) in y_tiles}
+        y_extents = {
+            nm: (ys, ye, xs, xe) for (nm, _t, _c, _z, ys, ye, xs, xe) in y_tiles
+        }
 
         for x0 in range(0, total_x, tx):
             x1 = min(total_x, x0 + tx)
             # Filter contributors for this specific (Y, X) block
-            contrib = set(find_contributing_fovs_yx((slice(y0, y1), slice(x0, x1)), y_extents))
+            contrib = set(
+                find_contributing_fovs_yx((slice(y0, y1), slice(x0, x1)), y_extents)
+            )
             # Numerator and denominator for this output block.
             # They are 5D: (T, C, Z, Y_block, X_block)
             numer = xp.zeros(
@@ -573,11 +577,17 @@ def assemble_streaming(
                         # If mask is fully non-zero, fall back to structural weights
                         # to avoid altering weights for channels without zero padding.
                         if int(xp.count_nonzero(nz2d)) == nz2d.size:
-                            wloc2d = tile_weights[iy0 - ys : iy1 - ys, ix0 - xs : ix1 - xs]
+                            wloc2d = tile_weights[
+                                iy0 - ys : iy1 - ys, ix0 - xs : ix1 - xs
+                            ]
                         else:
-                            _dist = cundi.distance_transform_edt(nz2d).astype(np.float32)
+                            _dist = cundi.distance_transform_edt(nz2d).astype(
+                                np.float32
+                            )
                             _dist += 1e-6
-                            wloc2d = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                            wloc2d = np.power(
+                                _dist, float(blending_exponent), where=(_dist > 0)
+                            )
                             wloc2d = xp.asarray(wloc2d, dtype=dtype_val)
                         # Expand to (T, 1, Z, Y, X) by broadcasting
                         wloc5 = wloc2d[None, None, None, :, :]
@@ -608,12 +618,14 @@ def assemble_streaming(
     # if can import get_optimal_workers, use it
     try:
         from ops_analysis.utils.resource_manager import get_optimal_workers
+
         workers = max(1, int(get_optimal_workers(use_gpu=False, verbose=False)))
     except ImportError:
         workers = 1
     if workers > 1:
         Parallel(n_jobs=workers, backend="threading")(
-            delayed(_process_y_band)(y0, y1) for (y0, y1) in tqdm(bands, desc="Stitching Y")
+            delayed(_process_y_band)(y0, y1)
+            for (y0, y1) in tqdm(bands, desc="Stitching Y")
         )
     else:
         for y0, y1 in tqdm(bands, desc="Stitching Y"):
