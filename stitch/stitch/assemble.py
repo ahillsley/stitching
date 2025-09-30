@@ -4,6 +4,7 @@ import math
 import zarr
 import dask.array as da
 from tqdm import tqdm
+from joblib import Parallel, delayed
 from stitch.stitch.tile import augment_tile, pairwise_shifts, optimal_positions
 from stitch.connect import read_shifts_biahub
 from collections import defaultdict
@@ -108,6 +109,37 @@ def get_output_shape(shifts: dict, tile_size: tuple) -> tuple:
     return max_x + tile_size[0], max_y + tile_size[1]
 
 
+def find_contributing_fovs_yx(
+    chunk: Tuple[slice, slice],
+    fov_extents: Dict[str, Tuple[int, int, int, int]],
+) -> list:
+    """Return FOV names whose YX extents overlap the given output chunk.
+
+    Parameters
+    ----------
+    chunk : Tuple[slice, slice]
+        Output block slices in (Y, X) order.
+    fov_extents : Dict[str, Tuple[int, int, int, int]]
+        Map of tile_name -> (ys, ye, xs, xe) extents in output coordinates.
+
+    Returns
+    -------
+    list
+        Names of FOVs overlapping the chunk.
+    """
+    ys_chunk, xs_chunk = chunk
+    y0, y1 = int(ys_chunk.start), int(ys_chunk.stop)
+    x0, x1 = int(xs_chunk.start), int(xs_chunk.stop)
+    contributing = []
+    for name, (ys, ye, xs, xe) in fov_extents.items():
+        if ye <= y0 or ys >= y1:
+            continue
+        if xe <= x0 or xs >= x1:
+            continue
+        contributing.append(name)
+    return contributing
+
+
 def assemble(
     shifts: dict,
     tile_size: tuple,
@@ -121,8 +153,19 @@ def assemble(
     blending_exponent: float = 1.0,
     value_precision_bits: Literal[16, 32, 64] = 32,
 ):
-    """Assemble the stitched image give the total shift of all tiles
-    - Assume that we have paired image / total shift to be applied
+    """Assemble a stitched mosaic in memory using provided tile shifts.
+
+    Overview of the in-memory path:
+    - Determine the target (T, C, Z) across tiles based on `tcz_policy`.
+    - Allocate a full output canvas in RAM for accumulation.
+    - If `blending_method=="edt"`, precompute a centered distance-transform weight map
+      for a single tile (YX) and reuse it for every tile placement. Otherwise use
+      legacy average-blending via per-pixel counts.
+    - For each tile, place the tile into the output canvas at its `(y, x)` shift.
+      When using EDT, accumulate `numerator += tile * weights` and `denominator += weights`.
+      For average, accumulate `sum += tile` and `count += (tile != 0)`.
+    - Normalize by dividing the accumulated numerator by the accumulated denominator.
+
     args:
         - shifts: dict of tile_name: (x_shift, y_shift)
         - tile_size: tuple of the tile size, only x and y dims
@@ -137,6 +180,8 @@ def assemble(
     fov_store = open_ome_zarr(fov_store_path)
 
     # Determine target T, C, Z according to policy across all tiles
+    # We compute the per-tile shapes and choose either the min or max
+    # along each dimension, to ensure all tiles fit in the final canvas.
     tcz_list = []
     for tname in shifts.keys():
         tcz_list.append(fov_store[tname].data.shape[:3])
@@ -178,6 +223,8 @@ def assemble(
         )
 
     # Resolve dtypes from requested precisions for 16, 32, 64
+    # We keep accumulation in floating types and shift indices in integer types
+    # to avoid precision issues or index overflow on very large mosaics.
     dtype_val = _resolve_value_dtype(value_precision_bits)
     # Start at 32-bit indices and promote as needed
     dtype_idx = _resolve_shift_dtype(shifts, tile_size, base_bits=32)
@@ -192,13 +239,17 @@ def assemble(
     # For legacy averaging we accumulate a divisor (counts). For EDT we accumulate a float weight sum.
     use_edt = str(blending_method).lower() == "edt"
     if use_edt:
+        # Denominator (sum of weights) accumulated alongside the numerator.
         weight_sum = xp.zeros(final_shape, dtype=dtype_val)
-        # Precompute or reuse a tile-local weight map based on distance to edges
+        # Precompute or reuse a tile-local weight map based on distance to edges.
+        # This is a single centered 2D EDT map (YX) broadcast to T, C, Z when placed.
         ty, tx = int(tile_size[0]), int(tile_size[1])
         cache_key = (ty, tx, int(float(blending_exponent) * 1e6))
         tile_weights = _EDT_WEIGHT_CACHE.get(cache_key)
         if tile_weights is None:
-            # Boolean mask with interior True, edges False
+            # Build a boolean mask with interior True, edges False.
+            # The EDT of this mask provides distances that increase away from the edges,
+            # which we exponentiate to control the sharpness of blend at overlaps.
             if ty > 2 and tx > 2:
                 import numpy as _np
 
@@ -260,7 +311,8 @@ def assemble(
                 xs:xe,
             ] += w_masked
         else:
-            # Legacy simple averaging by counts
+        # Legacy simple averaging by counts: track how many non-zero contributions
+        # each pixel received, to divide the sum at the end.
             output_image[
                 0:t_end,
                 0:c_end,
@@ -279,12 +331,15 @@ def assemble(
                 xs:xe,
             ] += divi_tile
 
+    # Allocate array for the normalized output
     stitched = xp.zeros_like(output_image, dtype=dtype_val)
 
     def _divide(a, b):
         return xp.nan_to_num(a / b)
 
     if use_edt:
+        # Normalize per block to keep memory usage bounded during division.
+        # output = numerator / sum_of_weights
         out = divide_tile(
             output_image,
             weight_sum,
@@ -320,14 +375,27 @@ def assemble_streaming(
     chunks_size: Optional[Tuple[int, int, int, int, int]] = None,
     scale: Optional[Tuple[float, float, float, float, float]] = None,
     divide_tile_size: Optional[Tuple[int, int]] = (1024, 1024),
+    debug_zero_mask: bool = True,
+
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
-    For each output YX block (divide_tile_size), accumulates numerator and denominator in RAM,
-    normalizes, and writes directly to the on-disk output image '0'. No auxiliary arrays are saved.
+    What this does (high-level):
+    - Determines a target (T, C, Z) and overall output canvas size from input tiles.
+    - Creates the output zarr array on disk, chunked for efficient streaming.
+    - Processes the mosaic in small (Y, X) blocks to bound peak RAM usage.
+    - For each block, accumulates a numerator and a denominator (weights):
+        - EDT blending: numerator += tile * local_EDT_weights; denominator += local_EDT_weights
+        - Average blending: numerator += tile; denominator += (tile != 0)
+    - Normalizes the block (numerator / max(denominator, eps)) and writes directly to disk.
+
+    This mirrors the logic in `biahub/stitch.py`: weights are computed from a centered
+    2D distance-from-edge map per tile, sliced to the overlapped region, and the
+    final pixel values are normalized by the sum of all contributing weights.
     """
     print(f"[assemble.streaming] Using blending_method: {blending_method}")
 
+    # Open the input store that contains all tile FOVs
     fov_store = open_ome_zarr(fov_store_path)
 
     # Determine target T,C,Z
@@ -350,11 +418,12 @@ def assemble_streaming(
     final_shape_xy = get_output_shape(shifts, tile_size)
     final_shape = tcz_target + final_shape_xy
 
+    # Choose default YX chunking for the output if none is provided; keep (T, C, Z)=1
     if chunks_size is None:
         ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
         chunks_size = (1, 1, 1, int(ty), int(tx))
 
-    # Create output array on disk only (no auxiliary arrays)
+    # Create output array on disk only (no auxiliary arrays). We will stream blocks into it.
     try:
         stitched_pos.create_zeros(
             "0",
@@ -370,27 +439,36 @@ def assemble_streaming(
     except Exception:
         pass
 
+    # Decide whether to use distance-transform-based blending or legacy averaging
     use_edt = str(blending_method).lower() == "edt"
 
-    # Precompute EDT weights for one tile
+    # In streaming mode, we will compute per-block, per-channel distance maps from
+    # the data-driven nonzero mask to exclude zero-padded regions before EDT.
+    # (A precomputed structural map can be used as a fallback if needed.)
+    tile_weights = None
     if use_edt:
         ty, tx = int(tile_size[0]), int(tile_size[1])
-        import numpy as _np
+        cache_key = (ty, tx, int(float(blending_exponent) * 1e6))
+        tile_weights = _EDT_WEIGHT_CACHE.get(cache_key)
+        if tile_weights is None:
+            if ty > 2 and tx > 2:
+                # Build a centered interior mask and compute its EDT once per tile size.
+                # We then exponentiate the distances to adjust blending sharpness.
+                _mask = np.zeros((ty, tx), dtype=bool)
+                _mask[1:-1, 1:-1] = True
+                _dist = cundi.distance_transform_edt(_mask).astype(np.float32)
+                _dist += 1e-6
+                _weights = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                tile_weights = xp.asarray(_weights, dtype=dtype_val)
+            else:
+                tile_weights = xp.ones((ty, tx), dtype=dtype_val)
+            _EDT_WEIGHT_CACHE[cache_key] = tile_weights
 
-        _mask = _np.zeros((ty, tx), dtype=bool)
-        if ty > 2 and tx > 2:
-            _mask[1:-1, 1:-1] = True
-        _dist = cundi.distance_transform_edt(_mask).astype(_np.float32)
-        _dist += 1e-6
-        _weights = _np.power(_dist, float(blending_exponent), where=(_dist > 0))
-        tile_weights = xp.asarray(_weights, dtype=dtype_val)
-    else:
-        tile_weights = None
-
+    # The output array that will receive normalized blocks
     arr_out = stitched_pos["0"]
     dtype_idx = _resolve_shift_dtype(shifts, tile_size, base_bits=32)
 
-    # Precompute tile metadata for fast intersection checks
+    # Precompute tile metadata (shape bounds and YX extents) for fast intersection checks
     tile_meta = []
     for tile_name, shift in shifts.items():
         tile_ref = fov_store[tile_name].data
@@ -402,11 +480,10 @@ def assemble_streaming(
         xs, xe = int(shift_array[1]), int(shift_array[1] + tile_size[1])
         tile_meta.append((tile_name, t_end, c_end, z_end, ys, ye, xs, xe))
 
-    # Blockwise accumulation over YX
+    # Blockwise accumulation over YX: iterate over output in manageable strips/tiles
     ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
     total_y, total_x = final_shape[-2], final_shape[-1]
-    for y0 in tqdm(range(0, total_y, ty), desc="Stitching Y"):
-        y1 = min(total_y, y0 + ty)
+    def _process_y_band(y0: int, y1: int):
         # Preload tiles intersecting this Y band once; reuse across all X blocks
         y_tiles = [
             (nm, t_end, c_end, z_end, ys, ye, xs, xe)
@@ -427,8 +504,15 @@ def assemble_streaming(
                 xe,
             )
 
+        # Dict for quick contributor filtering per X block
+        y_extents = {nm: (ys, ye, xs, xe) for (nm, _t, _c, _z, ys, ye, xs, xe) in y_tiles}
+
         for x0 in range(0, total_x, tx):
             x1 = min(total_x, x0 + tx)
+            # Filter contributors for this specific (Y, X) block
+            contrib = set(find_contributing_fovs_yx((slice(y0, y1), slice(x0, x1)), y_extents))
+            # Numerator and denominator for this output block.
+            # They are 5D: (T, C, Z, Y_block, X_block)
             numer = xp.zeros(
                 (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
                 dtype=dtype_val,
@@ -436,7 +520,9 @@ def assemble_streaming(
             denom = xp.zeros_like(numer, dtype=dtype_val)
 
             for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
-                # X intersection within this block
+                if tile_name not in contrib:
+                    continue
+                # Compute the intersection of the current output block with the tile's footprint
                 ix0 = max(x0, xs)
                 ix1 = min(x1, xe)
                 if ix0 >= ix1:
@@ -444,6 +530,7 @@ def assemble_streaming(
                 iy0 = max(y0, ys)
                 iy1 = min(y1, ye)
                 tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+                # Slices into the output block
                 out_sl = (
                     slice(0, t_end),
                     slice(0, c_end),
@@ -451,6 +538,7 @@ def assemble_streaming(
                     slice(iy0 - y0, iy1 - y0),
                     slice(ix0 - x0, ix1 - x0),
                 )
+                # Slices into the tile data
                 tile_sl = (
                     slice(0, t_end),
                     slice(0, c_end),
@@ -460,19 +548,48 @@ def assemble_streaming(
                 )
                 block = tile_full[tile_sl].astype(dtype_val, copy=False)
                 if use_edt:
-                    wloc = tile_weights[
-                        (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
-                    ]
-                    wloc = xp.asarray(wloc, dtype=dtype_val)
-                    nz = block != 0
-                    wloc = wloc * nz
-                    numer[out_sl] += block * wloc
-                    denom[out_sl] += wloc
+                    # Build a 2D mask per channel from data (exclude zeros), compute EDT on it,
+                    # and accumulate per-channel weighted sums.
+                    for c_idx in range(c_end):
+                        # Channel-specific out slice
+                        ch_out_sl = (
+                            slice(0, t_end),
+                            slice(c_idx, c_idx + 1),
+                            slice(0, z_end),
+                            slice(iy0 - y0, iy1 - y0),
+                            slice(ix0 - x0, ix1 - x0),
+                        )
+                        # Channel-specific data block (T, 1, Z, Y, X)
+                        block_ch = block[:, c_idx : c_idx + 1, :, :, :]
+                        # Collapse T and Z for a 2D nonzero mask (Y, X)
+                        nz2d = xp.any(block[:, c_idx, :, :, :] != 0, axis=(0, 1))
+                        if debug_zero_mask:
+                            total_px = nz2d.size
+                            nonzero_px = int(xp.count_nonzero(nz2d))
+                            zero_px = int(total_px - nonzero_px)
+                        if not xp.any(nz2d):
+                            # No signal for this channel in this intersection
+                            continue
+                        # If mask is fully non-zero, fall back to structural weights
+                        # to avoid altering weights for channels without zero padding.
+                        if int(xp.count_nonzero(nz2d)) == nz2d.size:
+                            wloc2d = tile_weights[iy0 - ys : iy1 - ys, ix0 - xs : ix1 - xs]
+                        else:
+                            _dist = cundi.distance_transform_edt(nz2d).astype(np.float32)
+                            _dist += 1e-6
+                            wloc2d = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                            wloc2d = xp.asarray(wloc2d, dtype=dtype_val)
+                        # Expand to (T, 1, Z, Y, X) by broadcasting
+                        wloc5 = wloc2d[None, None, None, :, :]
+                        numer[ch_out_sl] += block_ch * wloc5
+                        denom[ch_out_sl] += wloc5
                 else:
                     numer[out_sl] += block
                     denom[out_sl] += (block != 0).astype(dtype_val)
 
-            # Normalize and write this block
+            # Normalize and write this block to disk.
+            # Use a small epsilon via maximum() to avoid division-by-zero, and nan_to_num
+            # to clamp any remaining NaNs or infs to 0.
             norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
             arr_out[
                 (
@@ -485,6 +602,22 @@ def assemble_streaming(
             ] = norm
         # Free cache for this Y band
         tile_cache.clear()
+
+    # Parallelize across Y bands (disjoint writes in Y) using joblib (threading backend)
+    bands = [(y0, min(total_y, y0 + ty)) for y0 in range(0, total_y, ty)]
+    # if can import get_optimal_workers, use it
+    try:
+        from ops_analysis.utils.resource_manager import get_optimal_workers
+        workers = max(1, int(get_optimal_workers(use_gpu=False, verbose=False)))
+    except ImportError:
+        workers = 1
+    if workers > 1:
+        Parallel(n_jobs=workers, backend="threading")(
+            delayed(_process_y_band)(y0, y1) for (y0, y1) in tqdm(bands, desc="Stitching Y")
+        )
+    else:
+        for y0, y1 in tqdm(bands, desc="Stitching Y"):
+            _process_y_band(y0, y1)
 
     return stitched_pos["0"]
 
