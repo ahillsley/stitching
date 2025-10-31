@@ -24,6 +24,50 @@ from scipy import ndimage as cundi
 _EDT_WEIGHT_CACHE: Dict[Tuple[int, int, int], xp.ndarray] = {}
 
 
+def _discover_positions_fast(store_path: Path):
+    """Fast position discovery using filesystem globbing.
+
+    Only works for HCS layout: store/row/col/tile/0/.zarray
+    Returns list of position paths like "A/1/000123", or None if not HCS layout
+    """
+    store_path = Path(store_path)
+
+    # Check for HCS layout by looking for .zgroup and plate metadata
+    if not (store_path / ".zgroup").exists():
+        return None
+
+    # Check if it's HCS layout by looking for plate metadata
+    zattrs_path = store_path / ".zattrs"
+    if zattrs_path.exists():
+        import json
+
+        try:
+            with open(zattrs_path, "r") as f:
+                attrs = json.load(f)
+                # HCS stores have 'plate' metadata
+                if "plate" not in attrs:
+                    return None
+        except Exception:
+            return None
+
+    # Glob for all .zarray files at the expected depth
+    zarray_paths = sorted(store_path.glob("*/*/*/0/.zarray"))
+
+    if not zarray_paths:
+        return None
+
+    # Extract position paths (parent's parent's parent relative to store)
+    positions = []
+    for zarray in zarray_paths:
+        # zarray is at: store/row/col/tile/0/.zarray
+        # Position is: row/col/tile
+        tile_dir = zarray.parent.parent  # Go up from 0/.zarray to tile dir
+        rel_path = tile_dir.relative_to(store_path)
+        positions.append(str(rel_path))
+
+    return positions
+
+
 def _resolve_value_dtype(value_precision_bits: int):
     """Return a numpy dtype for requested float precision (16/32/64)."""
     bits = int(value_precision_bits)
@@ -615,12 +659,13 @@ def assemble_streaming(
 
     # Parallelize across Y bands (disjoint writes in Y) using joblib (threading backend)
     bands = [(y0, min(total_y, y0 + ty)) for y0 in range(0, total_y, ty)]
-    # if can import get_optimal_workers, use it
-    try:
-        from ops_analysis.utils.resource_manager import get_optimal_workers
 
+    try:
+        from stitch.stitch.resource_manager import get_optimal_workers
         workers = max(1, int(get_optimal_workers(use_gpu=False, verbose=False)))
-    except ImportError:
+        print(f"Using {workers} workers")
+    except Exception:
+        print("No resource manager found, using single worker")
         workers = 1
     if workers > 1:
         Parallel(n_jobs=workers, backend="threading")(
@@ -724,11 +769,25 @@ def estimate_stitch(
     overlap: int = 150,
     x_guess: Optional[dict] = None,
     limit_positions: Optional[int] = None,
+    channel: int = 0,
+    use_clahe: bool = False,
+    clahe_clip_limit: float = 0.02,
 ):
-    """Mimic of Biahub estimate stitch function"""
+    """Mimic of Biahub estimate stitch function
+
+    Args:
+        channel: Channel index to use for registration (default: 0)
+        use_clahe: Apply CLAHE preprocessing for better registration (default: False)
+        clahe_clip_limit: CLAHE contrast limit (default: 0.02)
+    """
 
     store = open_ome_zarr(input_store_path)
-    print(f"[assemble.estimate_stitch] Using {limit_positions} positions")
+    if limit_positions is not None and int(limit_positions) > 0:
+        print(
+            f"[assemble.estimate_stitch] DEBUG MODE: Limiting to {limit_positions} positions"
+        )
+    else:
+        print(f"[assemble.estimate_stitch] Processing ALL positions (full stitching)")
     # Discover positions with an optional centered selection to avoid scanning entire store in debug
     if limit_positions is not None and int(limit_positions) > 0:
         # Build a true centered m×m block for EACH well from the filesystem (no fallback)
@@ -784,10 +843,21 @@ def estimate_stitch(
             f"[assemble.estimate_stitch] Using centered grid {side}x{side} per well; total tiles={len(position_list)}"
         )
     else:
-        # Full list (may be large)
-        position_list = [
-            p for p, _ in tqdm(store.positions(), desc="Getting positions")
-        ]
+        # Full list (may be large) - try fast discovery first
+        position_list = _discover_positions_fast(Path(input_store_path))
+
+        if position_list is not None:
+            print(
+                f"[assemble.estimate_stitch] Fast discovery found {len(position_list)} positions"
+            )
+        else:
+            # Not HCS layout or fast discovery failed - use slower iterator
+            print(
+                f"[assemble.estimate_stitch] Not HCS layout, falling back to iterator-based discovery"
+            )
+            position_list = [
+                p for p, _ in tqdm(store.positions(), desc="Getting positions")
+            ]
 
     grouped_positions = defaultdict(list)
     for a in position_list:
@@ -808,6 +878,9 @@ def estimate_stitch(
             fliplr=fliplr,
             rot90=rot90,
             overlap=overlap,
+            channel=channel,
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
         )
 
         opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size, x_guess)
