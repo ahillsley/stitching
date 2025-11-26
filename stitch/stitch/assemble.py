@@ -16,8 +16,31 @@ import yaml
 from pathlib import Path
 import numpy as np
 
-import numpy as xp
-from scipy import ndimage as cundi
+# Try to use CuPy for GPU acceleration, fall back to NumPy
+try:
+    import cupy as xp
+    from cupyx.scipy import ndimage as cundi
+    _USING_CUPY = True
+    print("[assemble.py] Using CuPy (GPU) for array operations")
+except (ModuleNotFoundError, ImportError):
+    import numpy as xp
+    from scipy import ndimage as cundi
+    _USING_CUPY = False
+    print("[assemble.py] Using NumPy (CPU) for array operations")
+
+def _to_numpy(arr):
+    """Convert array to NumPy (transfers from GPU to CPU if needed)."""
+    if _USING_CUPY and isinstance(arr, xp.ndarray):
+        # Use synchronous transfer for correctness
+        return xp.asnumpy(arr)
+    return np.asarray(arr)
+
+def _load_to_gpu_async(data):
+    """Load data to GPU asynchronously if using CuPy."""
+    if _USING_CUPY:
+        # Use default stream for async transfer
+        return xp.asarray(data)
+    return xp.asarray(data)
 
 # Cache for EDT-based blending weight maps to avoid recomputation per tile size/exponent
 _EDT_WEIGHT_CACHE: Dict[Tuple[int, int, int], xp.ndarray] = {}
@@ -405,17 +428,24 @@ def assemble_streaming(
     # Blockwise accumulation over YX
     ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
     total_y, total_x = final_shape[-2], final_shape[-1]
-    for y0 in tqdm(range(0, total_y, ty), desc="Stitching Y"):
+
+    # Pre-identify all Y-bands and their tiles for batch loading
+    y_bands = []
+    for y0 in range(0, total_y, ty):
         y1 = min(total_y, y0 + ty)
-        # Preload tiles intersecting this Y band once; reuse across all X blocks
         y_tiles = [
             (nm, t_end, c_end, z_end, ys, ye, xs, xe)
             for (nm, t_end, c_end, z_end, ys, ye, xs, xe) in tile_meta
             if not (ye <= y0 or ys >= y1)
         ]
+        y_bands.append((y0, y1, y_tiles))
+
+    for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
+        # Load all tiles for this Y-band to GPU in one batch
         tile_cache = {}
         for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
             tile_full = fov_store[tile_name].data
+            # Transfer to GPU immediately after loading
             tile_cache[tile_name] = (
                 augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90),
                 t_end,
@@ -427,8 +457,17 @@ def assemble_streaming(
                 xe,
             )
 
+        # Optionally synchronize GPU before processing if using CuPy
+        if _USING_CUPY:
+            xp.cuda.Stream.null.synchronize()
+
+        # Process all X blocks for this Y band
+        x_blocks = []
         for x0 in range(0, total_x, tx):
             x1 = min(total_x, x0 + tx)
+            x_blocks.append((x0, x1))
+
+        for x0, x1 in x_blocks:
             numer = xp.zeros(
                 (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
                 dtype=dtype_val,
@@ -474,6 +513,8 @@ def assemble_streaming(
 
             # Normalize and write this block
             norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+            # Convert to NumPy for Zarr (transfers from GPU to CPU if using CuPy)
+            norm_cpu = _to_numpy(norm)
             arr_out[
                 (
                     slice(0, final_shape[0]),
@@ -482,9 +523,17 @@ def assemble_streaming(
                     slice(y0, y1),
                     slice(x0, x1),
                 )
-            ] = norm
+            ] = norm_cpu
+
+            # Free GPU memory immediately after writing
+            del numer, denom, norm, norm_cpu
+            if _USING_CUPY:
+                xp.get_default_memory_pool().free_all_blocks()
+
         # Free cache for this Y band
         tile_cache.clear()
+        if _USING_CUPY:
+            xp.get_default_memory_pool().free_all_blocks()
 
     return stitched_pos["0"]
 
