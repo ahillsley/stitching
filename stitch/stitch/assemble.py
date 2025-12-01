@@ -46,6 +46,124 @@ def _load_to_gpu_async(data):
 _EDT_WEIGHT_CACHE: Dict[Tuple[int, int, int], xp.ndarray] = {}
 
 
+def _get_optimal_block_size(final_shape, tile_size, default_size=(1024, 1024)):
+    """
+    Determine optimal block size based on available GPU memory.
+
+    Args:
+        final_shape: Full output shape (T, C, Z, Y, X)
+        tile_size: Individual tile size (Y, X)
+        default_size: Default block size if GPU not available
+
+    Returns:
+        Tuple of (block_y, block_x) sizes
+    """
+    if not _USING_CUPY:
+        return default_size
+
+    try:
+        # Get GPU memory info
+        mempool = xp.get_default_memory_pool()
+        device = xp.cuda.Device()
+        free_mem, total_mem = xp.cuda.runtime.memGetInfo()
+
+        # Estimate memory needed per block
+        # We need: numer + denom buffers, plus tile cache
+        dtype_size = 2  # float16
+        tcz_size = final_shape[0] * final_shape[1] * final_shape[2]
+
+        # Use 40% of free memory for block processing (conservative)
+        target_mem = free_mem * 0.4
+
+        # Calculate block size that fits in memory
+        # memory = tcz_size * block_y * block_x * dtype_size * 2 (numer + denom)
+        # Add buffer for tile cache
+        block_pixels_max = target_mem / (tcz_size * dtype_size * 3)  # 3x for safety margin
+
+        # Start with max tile dimension and find largest power-of-2 block
+        max_dim = max(tile_size)
+        block_size = min(4096, max_dim)  # Cap at 4096
+
+        while block_size * block_size > block_pixels_max and block_size > 512:
+            block_size //= 2
+
+        block_size = max(512, block_size)  # Minimum 512
+        block_size = min(block_size, final_shape[-2], final_shape[-1])  # Don't exceed image size
+
+        print(f"[GPU Memory] Free: {free_mem / 1e9:.2f} GB, Total: {total_mem / 1e9:.2f} GB")
+        print(f"[GPU Memory] Using block size: {block_size}x{block_size}")
+
+        return (block_size, block_size)
+
+    except Exception as e:
+        print(f"[GPU Memory] Could not determine optimal block size: {e}. Using default.")
+        return default_size
+
+
+def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype_val, use_edt, tile_weights, stream=None):
+    """
+    Process a single X block on GPU, optionally using a specific CUDA stream.
+
+    Returns (numer, denom, norm_cpu) tuple ready for writing.
+    """
+    # Create buffers on the specified stream (or default)
+    with xp.cuda.Stream(stream) if stream is not None else xp.cuda.Stream.null:
+        numer = xp.zeros(
+            (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
+            dtype=dtype_val,
+        )
+        denom = xp.zeros_like(numer, dtype=dtype_val)
+
+        for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
+            # X intersection within this block
+            ix0 = max(x0, xs)
+            ix1 = min(x1, xe)
+            if ix0 >= ix1:
+                continue
+            iy0 = max(y0, ys)
+            iy1 = min(y1, ye)
+
+            tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+            out_sl = (
+                slice(0, t_end),
+                slice(0, c_end),
+                slice(0, z_end),
+                slice(iy0 - y0, iy1 - y0),
+                slice(ix0 - x0, ix1 - x0),
+            )
+            tile_sl = (
+                slice(0, t_end),
+                slice(0, c_end),
+                slice(0, z_end),
+                slice(iy0 - ys, iy1 - ys),
+                slice(ix0 - xs, ix1 - xs),
+            )
+            block = tile_full[tile_sl].astype(dtype_val, copy=False)
+            if use_edt:
+                wloc = tile_weights[
+                    (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
+                ]
+                wloc = xp.asarray(wloc, dtype=dtype_val)
+                nz = block != 0
+                wloc = wloc * nz
+                numer[out_sl] += block * wloc
+                denom[out_sl] += wloc
+            else:
+                numer[out_sl] += block
+                denom[out_sl] += (block != 0).astype(dtype_val)
+
+        # Normalize
+        norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+
+        # Transfer to CPU for writing (synchronous on this stream)
+        norm_cpu = _to_numpy(norm)
+
+        # Clean up
+        del numer, denom, norm
+
+        return norm_cpu
+
+
 def _resolve_value_dtype(value_precision_bits: int):
     """Return a numpy dtype for requested float precision (16/32/64)."""
     bits = int(value_precision_bits)
@@ -343,13 +461,20 @@ def assemble_streaming(
     chunks_size: Optional[Tuple[int, int, int, int, int]] = None,
     scale: Optional[Tuple[float, float, float, float, float]] = None,
     divide_tile_size: Optional[Tuple[int, int]] = (1024, 1024),
+    use_adaptive_blocks: bool = True,
+    parallel_x_blocks: bool = True,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
     For each output YX block (divide_tile_size), accumulates numerator and denominator in RAM,
     normalizes, and writes directly to the on-disk output image '0'. No auxiliary arrays are saved.
+
+    Args:
+        use_adaptive_blocks: If True, automatically determine optimal block size based on GPU memory
+        parallel_x_blocks: If True, process X blocks in parallel using CUDA streams (GPU only)
     """
     print(f"[assemble.streaming] Using blending_method: {blending_method}")
+    print(f"[assemble.streaming] Adaptive blocks: {use_adaptive_blocks}, Parallel X-blocks: {parallel_x_blocks}")
 
     fov_store = open_ome_zarr(fov_store_path)
 
@@ -372,6 +497,10 @@ def assemble_streaming(
     dtype_val = _resolve_value_dtype(value_precision_bits)
     final_shape_xy = get_output_shape(shifts, tile_size)
     final_shape = tcz_target + final_shape_xy
+
+    # Adaptive block sizing based on GPU memory
+    if use_adaptive_blocks:
+        divide_tile_size = _get_optimal_block_size(final_shape, tile_size, divide_tile_size)
 
     if chunks_size is None:
         ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
@@ -467,68 +596,114 @@ def assemble_streaming(
             x1 = min(total_x, x0 + tx)
             x_blocks.append((x0, x1))
 
-        for x0, x1 in x_blocks:
-            numer = xp.zeros(
-                (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
-                dtype=dtype_val,
-            )
-            denom = xp.zeros_like(numer, dtype=dtype_val)
+        # Parallel X-block processing using CUDA streams (GPU only)
+        if parallel_x_blocks and _USING_CUPY and len(x_blocks) > 1:
+            print(f"[Parallel] Processing {len(x_blocks)} X-blocks in parallel for Y-band {band_idx+1}/{len(y_bands)}")
 
-            for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
-                # X intersection within this block
-                ix0 = max(x0, xs)
-                ix1 = min(x1, xe)
-                if ix0 >= ix1:
-                    continue
-                iy0 = max(y0, ys)
-                iy1 = min(y1, ye)
-                tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
-                out_sl = (
-                    slice(0, t_end),
-                    slice(0, c_end),
-                    slice(0, z_end),
-                    slice(iy0 - y0, iy1 - y0),
-                    slice(ix0 - x0, ix1 - x0),
-                )
-                tile_sl = (
-                    slice(0, t_end),
-                    slice(0, c_end),
-                    slice(0, z_end),
-                    slice(iy0 - ys, iy1 - ys),
-                    slice(ix0 - xs, ix1 - xs),
-                )
-                block = tile_full[tile_sl].astype(dtype_val, copy=False)
-                if use_edt:
-                    wloc = tile_weights[
-                        (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
-                    ]
-                    wloc = xp.asarray(wloc, dtype=dtype_val)
-                    nz = block != 0
-                    wloc = wloc * nz
-                    numer[out_sl] += block * wloc
-                    denom[out_sl] += wloc
-                else:
-                    numer[out_sl] += block
-                    denom[out_sl] += (block != 0).astype(dtype_val)
+            # Create streams for parallel processing (limit to 4 concurrent streams)
+            num_streams = min(4, len(x_blocks))
+            streams = [xp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
 
-            # Normalize and write this block
-            norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
-            # Convert to NumPy for Zarr (transfers from GPU to CPU if using CuPy)
-            norm_cpu = _to_numpy(norm)
-            arr_out[
-                (
-                    slice(0, final_shape[0]),
-                    slice(0, final_shape[1]),
-                    slice(0, final_shape[2]),
-                    slice(y0, y1),
-                    slice(x0, x1),
-                )
-            ] = norm_cpu
+            # Process blocks in batches
+            for batch_start in range(0, len(x_blocks), num_streams):
+                batch_end = min(batch_start + num_streams, len(x_blocks))
+                batch_blocks = x_blocks[batch_start:batch_end]
 
-            # Free GPU memory immediately after writing
-            del numer, denom, norm, norm_cpu
-            if _USING_CUPY:
-                xp.get_default_memory_pool().free_all_blocks()
+                # Launch processing on streams
+                results = []
+                for idx, (x0, x1) in enumerate(batch_blocks):
+                    stream = streams[idx % num_streams]
+                    norm_cpu = _process_x_block_gpu(
+                        x0, x1, y0, y1, y_tiles, tile_cache, final_shape,
+                        dtype_val, use_edt, tile_weights, stream
+                    )
+                    results.append((x0, x1, norm_cpu))
+
+                # Synchronize streams before writing
+                for stream in streams[:len(batch_blocks)]:
+                    stream.synchronize()
+
+                # Write results sequentially (I/O is sequential anyway)
+                for x0, x1, norm_cpu in results:
+                    arr_out[
+                        (
+                            slice(0, final_shape[0]),
+                            slice(0, final_shape[1]),
+                            slice(0, final_shape[2]),
+                            slice(y0, y1),
+                            slice(x0, x1),
+                        )
+                    ] = norm_cpu
+                    del norm_cpu
+
+                # Free GPU memory after batch
+                if _USING_CUPY:
+                    xp.get_default_memory_pool().free_all_blocks()
+
+        else:
+            # Sequential processing (fallback or CPU)
+            for x0, x1 in x_blocks:
+                numer = xp.zeros(
+                    (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
+                    dtype=dtype_val,
+                )
+                denom = xp.zeros_like(numer, dtype=dtype_val)
+
+                for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
+                    # X intersection within this block
+                    ix0 = max(x0, xs)
+                    ix1 = min(x1, xe)
+                    if ix0 >= ix1:
+                        continue
+                    iy0 = max(y0, ys)
+                    iy1 = min(y1, ye)
+                    tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+                    out_sl = (
+                        slice(0, t_end),
+                        slice(0, c_end),
+                        slice(0, z_end),
+                        slice(iy0 - y0, iy1 - y0),
+                        slice(ix0 - x0, ix1 - x0),
+                    )
+                    tile_sl = (
+                        slice(0, t_end),
+                        slice(0, c_end),
+                        slice(0, z_end),
+                        slice(iy0 - ys, iy1 - ys),
+                        slice(ix0 - xs, ix1 - xs),
+                    )
+                    block = tile_full[tile_sl].astype(dtype_val, copy=False)
+                    if use_edt:
+                        wloc = tile_weights[
+                            (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
+                        ]
+                        wloc = xp.asarray(wloc, dtype=dtype_val)
+                        nz = block != 0
+                        wloc = wloc * nz
+                        numer[out_sl] += block * wloc
+                        denom[out_sl] += wloc
+                    else:
+                        numer[out_sl] += block
+                        denom[out_sl] += (block != 0).astype(dtype_val)
+
+                # Normalize and write this block
+                norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+                # Convert to NumPy for Zarr (transfers from GPU to CPU if using CuPy)
+                norm_cpu = _to_numpy(norm)
+                arr_out[
+                    (
+                        slice(0, final_shape[0]),
+                        slice(0, final_shape[1]),
+                        slice(0, final_shape[2]),
+                        slice(y0, y1),
+                        slice(x0, x1),
+                    )
+                ] = norm_cpu
+
+                # Free GPU memory immediately after writing
+                del numer, denom, norm, norm_cpu
+                if _USING_CUPY:
+                    xp.get_default_memory_pool().free_all_blocks()
 
         # Free cache for this Y band
         tile_cache.clear()
