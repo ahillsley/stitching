@@ -468,10 +468,6 @@ def assemble_streaming(
                     wloc = wloc * nz
                     numer[out_sl] += block * wloc
                     denom[out_sl] += wloc
-                else:
-                    numer[out_sl] += block
-                    denom[out_sl] += (block != 0).astype(dtype_val)
-
             # Normalize and write this block
             norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
             arr_out[
@@ -544,7 +540,7 @@ def stitch(
     for g in grouped_shifts.keys():
         shifts = grouped_shifts[g]
         # Streamed assembly into output zarr without allocating full canvas in RAM
-        stitched_pos = output_store.create_position("A", g, "0")
+        stitched_pos = output_store.create_position("B", g, "0") #changed to B
         assemble_streaming(
             shifts=shifts,
             tile_size=tile_shape[-2:],
@@ -579,11 +575,15 @@ def estimate_stitch(
     overlap: int = 150,
     x_guess: Optional[dict] = None,
     limit_positions: Optional[int] = None,
+    t_index: Optional[int] = None,
 ):
     """Mimic of Biahub estimate stitch function"""
 
     store = open_ome_zarr(input_store_path)
     print(f"[assemble.estimate_stitch] Using {limit_positions} positions")
+    if t_index is not None:
+        print(f"[assemble.estimate_stitch] Restricting to t_index={t_index}")
+
     # Discover positions with an optional centered selection to avoid scanning entire store in debug
     if limit_positions is not None and int(limit_positions) > 0:
         # Build a true centered m×m block for EACH well from the filesystem (no fallback)
@@ -663,6 +663,7 @@ def estimate_stitch(
             fliplr=fliplr,
             rot90=rot90,
             overlap=overlap,
+            t_index=t_index,
         )
 
         opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size, x_guess)

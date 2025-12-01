@@ -69,13 +69,14 @@ class TileCache:
     - get_item
     """
 
-    def __init__(self, store_path, well, flipud, fliplr, rot90):
+    def __init__(self, store_path, well, flipud, fliplr, rot90, t_index: Optional[int] = None):
         self.cache = LimitedSizeDict(max_size=20)
         self.store = open_ome_zarr(store_path)
         self.well = well
         self.flipud = flipud
         self.fliplr = fliplr
         self.rot90 = rot90
+        self.t_index = t_index
 
     def add(self, obj):
         """add an object to the cache"""
@@ -99,18 +100,27 @@ class TileCache:
     def load_tile(self, key):
         """load a tile and add it to the cache"""
         da_tile = da.from_array(self.store[f"{self.well}/{key}"].data)
+        # OME: (T, C, Z, Y, X)
+        t_idx = self.t_index if self.t_index is not None else 0
+
+        # guard against t_idx >= number of timepoints
+        if t_idx >= da_tile.shape[0]:
+            raise IndexError(
+                f"Requested t_index={t_idx} but tile {self.well}/{key} has only {da_tile.shape[0]} time frames."
+            )
+
+        # Still using channel 0, z-slice 0; we only change which time frame we pick
+        tile_2d = da_tile[t_idx, 0, 0, :, :].compute()
 
         aug_tile = augment_tile(
-            da_tile[
-                0, 0, 0, :, :
-            ].compute(),  # TODO: hardcoded to 2D # TODO: changed to 100!
+            tile_2d,
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
         )
-        # hardcoded for now to only take first slice and time-point
         self.cache[key] = aug_tile
         return aug_tile
+
 
 
 def augment_tile(tile: np.ndarray, flipud: bool, fliplr: bool, rot90: int) -> np.array:
@@ -169,6 +179,8 @@ def pairwise_shifts(
     fliplr: bool,
     rot90: bool,
     overlap: int = 150,
+    t_index: Optional[int] = None,
+
 ) -> List:
     """ """
     # get neighboring tiles
@@ -182,6 +194,7 @@ def pairwise_shifts(
         flipud=flipud,
         fliplr=fliplr,
         rot90=rot90,
+        t_index=t_index,
     )
 
     edge_list = []
