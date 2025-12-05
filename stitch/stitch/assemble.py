@@ -20,8 +20,17 @@ import numpy as np
 try:
     import cupy as xp
     from cupyx.scipy import ndimage as cundi
-    _USING_CUPY = True
-    print("[assemble.py] Using CuPy (GPU) for array operations")
+    # Check if GPU is actually available at runtime
+    try:
+        _ = xp.array([1.0])  # Test GPU access
+        _USING_CUPY = True
+        print("[assemble.py] Using CuPy (GPU) for array operations")
+    except Exception as e:
+        # CuPy imported but no GPU available - fallback to CPU
+        print(f"[assemble.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+        import numpy as xp
+        from scipy import ndimage as cundi
+        _USING_CUPY = False
 except (ModuleNotFoundError, ImportError):
     import numpy as xp
     from scipy import ndimage as cundi

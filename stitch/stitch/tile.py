@@ -20,8 +20,17 @@ from stitch.stitch.graph import connectivity, hilbert_over_points
 try:
     import cupy as xp
     from cupyx.scipy import ndimage as cundi
-    _USING_CUPY = True
-    print("[tile.py] Using CuPy (GPU) for registration")
+    # Check if GPU is actually available at runtime
+    try:
+        _ = xp.array([1.0])  # Test GPU access
+        _USING_CUPY = True
+        print("[tile.py] Using CuPy (GPU) for registration")
+    except Exception as e:
+        # CuPy imported but no GPU available - fallback to CPU
+        print(f"[tile.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+        import numpy as xp
+        from scipy import ndimage as cundi
+        _USING_CUPY = False
 except (ModuleNotFoundError, ImportError):
     import numpy as xp
     from scipy import ndimage as cundi
@@ -241,10 +250,9 @@ def offset(
     # Use GPU-accelerated registration
     if _USING_CUPY:
         shift_vector, confidence = register_translation_gpu(roi_a, roi_b)
-        # Create model manually
-        model = TranslationRegistrationModel()
-        model.shift_vector = shift_vector + np.array([corr_y, corr_x])
-        model.confidence = confidence
+        # Create model with required arguments
+        adjusted_shift = shift_vector + np.array([corr_y, corr_x])
+        model = TranslationRegistrationModel(shift_vector=adjusted_shift, confidence=confidence)
     else:
         # CPU fallback
         model = dexp_reg.register_translation_nd(roi_a, roi_b)
