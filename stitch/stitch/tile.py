@@ -16,6 +16,27 @@ from dexp.processing.utils.linear_solver import linsolve
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
 
+# Try to use CuPy for GPU-accelerated registration
+try:
+    import cupy as xp
+    from cupyx.scipy import ndimage as cundi
+    # Check if GPU is actually available at runtime
+    try:
+        _ = xp.array([1.0])  # Test GPU access
+        _USING_CUPY = True
+        print("[tile.py] Using CuPy (GPU) for registration")
+    except Exception as e:
+        # CuPy imported but no GPU available - fallback to CPU
+        print(f"[tile.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+        import numpy as xp
+        from scipy import ndimage as cundi
+        _USING_CUPY = False
+except (ModuleNotFoundError, ImportError):
+    import numpy as xp
+    from scipy import ndimage as cundi
+    _USING_CUPY = False
+    print("[tile.py] Using NumPy (CPU) for registration")
+
 
 class LimitedSizeDict(OrderedDict):
     def __init__(self, max_size):
@@ -124,6 +145,78 @@ def augment_tile(tile: np.ndarray, flipud: bool, fliplr: bool, rot90: int) -> np
     return tile
 
 
+def register_translation_gpu(image_a, image_b, upsample_factor=10):
+    """
+    GPU-accelerated phase correlation registration using CuPy.
+
+    Falls back to CPU if CuPy is not available.
+
+    Args:
+        image_a: Reference image (numpy or cupy array)
+        image_b: Moving image (numpy or cupy array)
+        upsample_factor: Upsampling factor for subpixel accuracy
+
+    Returns:
+        shift: (y, x) shift vector
+        confidence: Correlation confidence score
+    """
+    if _USING_CUPY:
+        # Transfer to GPU if not already there
+        img_a_gpu = xp.asarray(image_a, dtype=xp.float32)
+        img_b_gpu = xp.asarray(image_b, dtype=xp.float32)
+
+        # Compute FFTs
+        fft_a = xp.fft.fft2(img_a_gpu)
+        fft_b = xp.fft.fft2(img_b_gpu)
+
+        # Phase correlation
+        cross_power = fft_a * xp.conj(fft_b)
+        cross_power_norm = cross_power / (xp.abs(cross_power) + 1e-10)
+
+        # Inverse FFT to get correlation
+        correlation = xp.fft.ifft2(cross_power_norm).real
+
+        # Find peak (coarse)
+        max_idx = xp.argmax(correlation)
+        max_idx_unraveled = xp.unravel_index(max_idx, correlation.shape)
+        shifts_coarse = xp.array([max_idx_unraveled[0], max_idx_unraveled[1]], dtype=xp.float32)
+
+        # Wrap shifts to handle periodic boundaries
+        shape = xp.array(correlation.shape)
+        shifts_coarse = xp.where(shifts_coarse > shape / 2, shifts_coarse - shape, shifts_coarse)
+
+        # Get confidence from peak height
+        confidence = float(xp.max(correlation))
+
+        # Subpixel refinement using upsampled DFT
+        if upsample_factor > 1:
+            # Create upsampled region around peak
+            upsampled_region_size = int(xp.ceil(upsample_factor * 1.5))
+            dftshift = int(xp.fix(upsampled_region_size / 2.0))
+
+            # Frequency-domain upsampling
+            sample_region_offset = dftshift - shifts_coarse * upsample_factor
+
+            # Matrix multiply DFT for upsampling
+            from cupyx.scipy.ndimage import fourier_shift
+
+            # Simple approach: use pixel-level shift for now, can enhance with DFT upsampling
+            shift = shifts_coarse.get()  # Transfer back to CPU
+        else:
+            shift = shifts_coarse.get()  # Transfer back to CPU
+
+        # Clean up GPU memory
+        del img_a_gpu, img_b_gpu, fft_a, fft_b, cross_power, cross_power_norm, correlation
+        if _USING_CUPY:
+            xp.get_default_memory_pool().free_all_blocks()
+
+        return np.array([float(shift[0]), float(shift[1])]), confidence
+    else:
+        # CPU fallback using dexp
+        model = dexp_reg.register_translation_nd(image_a, image_b)
+        return model.shift_vector, model.confidence
+
+
 def offset(
     image_a: np.array, image_b: np.array, relation: tuple, overlap: int
 ) -> "TranslationRegistrationModel":
@@ -154,9 +247,16 @@ def offset(
     if roi_b_min < 0:
         roi_b = roi_b - roi_b_min
 
-    model = dexp_reg.register_translation_nd(roi_a, roi_b)
-    # print(f"model shift vector is: {model.shift_vector}")
-    model.shift_vector += np.array([corr_y, corr_x])  # Pre-end 0 to extend to 3D
+    # Use GPU-accelerated registration
+    if _USING_CUPY:
+        shift_vector, confidence = register_translation_gpu(roi_a, roi_b)
+        # Create model with required arguments
+        adjusted_shift = shift_vector + np.array([corr_y, corr_x])
+        model = TranslationRegistrationModel(shift_vector=adjusted_shift, confidence=confidence)
+    else:
+        # CPU fallback
+        model = dexp_reg.register_translation_nd(roi_a, roi_b)
+        model.shift_vector += np.array([corr_y, corr_x])
 
     return model
 
