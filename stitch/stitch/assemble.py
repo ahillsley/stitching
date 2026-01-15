@@ -15,6 +15,8 @@ from itertools import product
 import yaml
 from pathlib import Path
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Try to use CuPy for GPU acceleration, fall back to NumPy
 try:
@@ -722,6 +724,47 @@ def assemble_streaming(
     return stitched_pos["0"]
 
 
+def _process_single_well(well_id, shifts, output_store, input_store_path, tile_shape,
+                        flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
+                        well_lock):
+    """
+    Process a single well for parallel stitching.
+    Thread-safe helper function to stitch one well.
+    """
+    try:
+        print(f"[Parallel Wells] Starting well {well_id}")
+
+        # Thread-safe creation of stitched position
+        with well_lock:
+            stitched_pos = output_store.create_position("A", well_id, "0")
+
+        # Process well (this is where GPU computation happens)
+        assemble_streaming(
+            shifts=shifts,
+            tile_size=tile_shape[-2:],
+            fov_store_path=input_store_path,
+            stitched_pos=stitched_pos,
+            flipud=flipud,
+            fliplr=fliplr,
+            rot90=rot90,
+            tcz_policy=kwargs.get("tcz_policy", "min"),
+            blending_method=blending_method,
+            blending_exponent=kwargs.get("blending_exponent", 1.0),
+            value_precision_bits=kwargs.get("value_precision_bits", 32),
+            chunks_size=chunks_size,
+            scale=scale,
+            divide_tile_size=kwargs.get("target_chunks_yx", (1024, 1024)),
+        )
+
+        del stitched_pos  # free reference
+        print(f"[Parallel Wells] ✅ Completed well {well_id}")
+        return well_id, True
+
+    except Exception as e:
+        print(f"[Parallel Wells] ❌ Failed well {well_id}: {e}")
+        return well_id, False
+
+
 def stitch(
     config_path: str,
     input_store_path: str,
@@ -773,31 +816,54 @@ def stitch(
         output_store_path, layout="hcs", mode="w-", channel_names=channel_names
     )
     print("output store created")
-    # call assemble for each well
-    for g in grouped_shifts.keys():
-        shifts = grouped_shifts[g]
-        # Streamed assembly into output zarr without allocating full canvas in RAM
-        stitched_pos = output_store.create_position("A", g, "0")
-        assemble_streaming(
-            shifts=shifts,
-            tile_size=tile_shape[-2:],
-            fov_store_path=input_store_path,
-            stitched_pos=stitched_pos,
-            flipud=flipud,
-            fliplr=fliplr,
-            rot90=rot90,
-            tcz_policy=kwargs.get("tcz_policy", "min"),
-            blending_method=blending_method,
-            blending_exponent=kwargs.get("blending_exponent", 1.0),
-            value_precision_bits=kwargs.get("value_precision_bits", 32),
-            chunks_size=chunks_size,
-            scale=scale,
-            divide_tile_size=kwargs.get("target_chunks_yx", (1024, 1024)),
-        )
-        del stitched_pos  # free reference
-        print("-" * 30)
-        print("finished a well")
-        print("-" * 30)
+
+    # PARALLEL WELL PROCESSING - Process wells in parallel using ThreadPoolExecutor
+    well_ids = list(grouped_shifts.keys())
+    num_wells = len(well_ids)
+    max_workers = min(4, num_wells)  # Limit to 4 parallel wells to avoid resource contention
+
+    print(f"[Parallel Wells] Processing {num_wells} wells with {max_workers} parallel workers")
+    print(f"[Parallel Wells] Wells: {well_ids}")
+
+    # Thread lock for thread-safe zarr store operations
+    well_lock = threading.Lock()
+
+    # Use ThreadPoolExecutor for parallel well processing
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all well processing tasks
+        futures = []
+        for well_id in well_ids:
+            shifts = grouped_shifts[well_id]
+            future = executor.submit(
+                _process_single_well,
+                well_id, shifts, output_store, input_store_path, tile_shape,
+                flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
+                well_lock
+            )
+            futures.append((well_id, future))
+
+        # Wait for all wells to complete and collect results
+        completed_wells = []
+        failed_wells = []
+
+        for well_id, future in futures:
+            try:
+                result_well_id, success = future.result()
+                if success:
+                    completed_wells.append(result_well_id)
+                else:
+                    failed_wells.append(result_well_id)
+            except Exception as e:
+                print(f"[Parallel Wells] ❌ Exception in well {well_id}: {e}")
+                failed_wells.append(well_id)
+
+    # Report final results
+    print(f"[Parallel Wells] ✅ Completed: {len(completed_wells)} wells: {completed_wells}")
+    if failed_wells:
+        print(f"[Parallel Wells] ❌ Failed: {len(failed_wells)} wells: {failed_wells}")
+        raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
+
+    print(f"[Parallel Wells] 🎉 All {num_wells} wells processed successfully!")
 
     return
 
