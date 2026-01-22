@@ -134,14 +134,25 @@ class TileCache:
         return aug_tile
 
 
-def augment_tile(tile: np.ndarray, flipud: bool, fliplr: bool, rot90: int) -> np.array:
-    """Augment a tile with flips and rotations"""
-    if flipud:
-        tile = np.flip(tile, axis=-2)
-    if fliplr:
-        tile = np.flip(tile, axis=-1)
-    if rot90:
-        tile = np.rot90(tile, k=rot90, axes=(-2, -1))
+def augment_tile(tile, flipud: bool, fliplr: bool, rot90: int):
+    """Augment a tile with flips and rotations using appropriate array library (CuPy or NumPy)"""
+    # Determine which array library to use based on input type
+    if _USING_CUPY and hasattr(tile, '__array_ufunc__') and 'cupy' in str(type(tile)):
+        # Use CuPy operations for GPU arrays
+        if flipud:
+            tile = xp.flip(tile, axis=-2)
+        if fliplr:
+            tile = xp.flip(tile, axis=-1)
+        if rot90:
+            tile = xp.rot90(tile, k=rot90, axes=(-2, -1))
+    else:
+        # Use NumPy operations for CPU arrays
+        if flipud:
+            tile = np.flip(tile, axis=-2)
+        if fliplr:
+            tile = np.flip(tile, axis=-1)
+        if rot90:
+            tile = np.rot90(tile, k=rot90, axes=(-2, -1))
     return tile
 
 
@@ -240,8 +251,8 @@ def offset(
         corr_y = shape[-1] - overlap
 
     # phase images are centered at 0, shift to make them all positive
-    roi_a_min = np.min(roi_a)
-    roi_b_min = np.min(roi_b)
+    roi_a_min = xp.min(roi_a)
+    roi_b_min = xp.min(roi_b)
     if roi_a_min < 0:
         roi_a = roi_a - roi_a_min
     if roi_b_min < 0:
