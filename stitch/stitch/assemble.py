@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import time
 
 # Try to use CuPy for GPU acceleration, fall back to NumPy
 try:
@@ -581,21 +582,32 @@ def assemble_streaming(
         y_bands.append((y0, y1, y_tiles))
 
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
-        # Load all tiles for this Y-band to GPU in one batch
+        t_band_start = time.time()
+
+        # Load all tiles for this Y-band to GPU in parallel
+        t_load_start = time.time()
         tile_cache = {}
-        for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
+
+        def load_single_tile(tile_meta):
+            """Load and augment a single tile."""
+            tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
             tile_full = fov_store[tile_name].data
             # Transfer to GPU immediately after loading
-            tile_cache[tile_name] = (
-                augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90),
-                t_end,
-                c_end,
-                z_end,
-                ys,
-                ye,
-                xs,
-                xe,
-            )
+            tile_gpu = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
+            return tile_name, (tile_gpu, t_end, c_end, z_end, ys, ye, xs, xe)
+
+        # Load tiles in parallel using ThreadPoolExecutor
+        # Zarr I/O releases GIL, so threads work well for parallel loading
+        # Limited to 6 workers to balance speed and GPU memory (requires 80GB+ GPU for 3 parallel wells)
+        with ThreadPoolExecutor(max_workers=min(6, len(y_tiles))) as executor:
+            futures = {executor.submit(load_single_tile, tile_meta): tile_meta[0]
+                      for tile_meta in y_tiles}
+            for future in as_completed(futures):
+                tile_name, tile_data = future.result()
+                tile_cache[tile_name] = tile_data
+
+        t_load_elapsed = time.time() - t_load_start
+        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles in parallel: {t_load_elapsed:.2f}s")
 
         # Optionally synchronize GPU before processing if using CuPy
         if _USING_CUPY:
@@ -608,8 +620,9 @@ def assemble_streaming(
             x_blocks.append((x0, x1))
 
         # Parallel X-block processing using CUDA streams (GPU only)
+        t_process_start = time.time()
         if parallel_x_blocks and _USING_CUPY and len(x_blocks) > 1:
-            print(f"[Parallel] Processing {len(x_blocks)} X-blocks in parallel for Y-band {band_idx+1}/{len(y_bands)}")
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks in parallel...")
 
             # Create streams for parallel processing (limit to 4 concurrent streams)
             num_streams = min(4, len(x_blocks))
@@ -651,8 +664,12 @@ def assemble_streaming(
                 if _USING_CUPY:
                     xp.get_default_memory_pool().free_all_blocks()
 
+            t_process_elapsed = time.time() - t_process_start
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s")
+
         else:
             # Sequential processing (fallback or CPU)
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks sequentially...")
             for x0, x1 in x_blocks:
                 numer = xp.zeros(
                     (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
@@ -716,10 +733,16 @@ def assemble_streaming(
                 if _USING_CUPY:
                     xp.get_default_memory_pool().free_all_blocks()
 
+            t_process_elapsed = time.time() - t_process_start
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing: {t_process_elapsed:.2f}s")
+
         # Free cache for this Y band
         tile_cache.clear()
         if _USING_CUPY:
             xp.get_default_memory_pool().free_all_blocks()
+
+        t_band_elapsed = time.time() - t_band_start
+        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
 
     return stitched_pos["0"]
 
