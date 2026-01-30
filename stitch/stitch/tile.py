@@ -17,6 +17,15 @@ from dexp.processing.utils.linear_solver import linsolve
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
 
+# Import CuPy sparse support for GPU-accelerated sparse operations
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cp_sparse
+    from dexp.utils.backends import CupyBackend
+    _CUPY_SPARSE_AVAILABLE = True
+except ImportError:
+    _CUPY_SPARSE_AVAILABLE = False
+
 # Try to use CuPy for GPU-accelerated registration
 try:
     import cupy as xp
@@ -377,30 +386,88 @@ def optimal_positions(
     alpha_reg = 0
     maxiter = 1e8
 
-    # Note: scipy sparse matrices work efficiently on CPU
-    # GPU acceleration would require converting to dense (memory intensive)
-    # or using cupyx.scipy.sparse (complex conversion)
-    print("optimizing positions")
-    opt_i = linsolve(
-        a,
-        y_i,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=i_guess,
-        maxiter=maxiter,
-    )
-    opt_j = linsolve(
-        a,
-        y_j,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=j_guess,
-        maxiter=maxiter,
-    )
+    # Try GPU acceleration with cupyx.scipy.sparse if available
+    if _CUPY_SPARSE_AVAILABLE and _USING_CUPY:
+        try:
+            print("optimizing positions (GPU-accelerated with sparse matrices)")
+            # Convert scipy sparse matrix to cupyx sparse matrix
+            a_gpu = cp_sparse.csr_matrix(a)
+            y_i_gpu = cp.asarray(y_i)
+            y_j_gpu = cp.asarray(y_j)
+            i_guess_gpu = cp.asarray(i_guess)
+            j_guess_gpu = cp.asarray(j_guess)
+
+            # Use CuPy backend for linsolve
+            with CupyBackend():
+                opt_i_gpu = linsolve(
+                    a_gpu,
+                    y_i_gpu,
+                    tolerance=tolerance,
+                    order_error=order_error,
+                    order_reg=order_reg,
+                    alpha_reg=alpha_reg,
+                    x0=i_guess_gpu,
+                    maxiter=maxiter,
+                )
+                opt_j_gpu = linsolve(
+                    a_gpu,
+                    y_j_gpu,
+                    tolerance=tolerance,
+                    order_error=order_error,
+                    order_reg=order_reg,
+                    alpha_reg=alpha_reg,
+                    x0=j_guess_gpu,
+                    maxiter=maxiter,
+                )
+
+            # Convert results back to numpy
+            opt_i = cp.asnumpy(opt_i_gpu)
+            opt_j = cp.asnumpy(opt_j_gpu)
+        except Exception as e:
+            print(f"GPU optimization failed ({e}), falling back to CPU")
+            opt_i = linsolve(
+                a,
+                y_i,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                x0=i_guess,
+                maxiter=maxiter,
+            )
+            opt_j = linsolve(
+                a,
+                y_j,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                x0=j_guess,
+                maxiter=maxiter,
+            )
+    else:
+        print("optimizing positions (CPU)")
+        opt_i = linsolve(
+            a,
+            y_i,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=i_guess,
+            maxiter=maxiter,
+        )
+        opt_j = linsolve(
+            a,
+            y_j,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=j_guess,
+            maxiter=maxiter,
+        )
+
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
     opt_shifts_zeroed = opt_shifts - np.min(opt_shifts, axis=0)
