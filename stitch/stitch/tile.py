@@ -402,12 +402,29 @@ def _linsolve_gpu(a_sparse, y, x0, tolerance, order_error, order_reg, alpha_reg,
         line_search_fn='strong_wolfe'
     )
 
+    # Track function evaluations to see if optimizer is working
+    n_iter = [0]
+    initial_loss = [None]
+
+    def closure_with_counting():
+        n_iter[0] += 1
+        loss = closure()
+        if initial_loss[0] is None:
+            initial_loss[0] = loss.item()
+        return loss
+
     # Call step() once - PyTorch LBFGS handles all iterations internally
     # The optimizer will run until convergence or max_iter
-    loss = optimizer.step(closure)
+    loss = optimizer.step(closure_with_counting)
 
     final_loss = loss.item()
-    print(f"    Optimization complete: final loss = {final_loss:.6e}")
+    improvement = initial_loss[0] - final_loss if initial_loss[0] else 0
+    improvement_pct = (improvement / initial_loss[0] * 100) if initial_loss[0] else 0
+
+    print(f"    Optimization complete after {n_iter[0]} function evaluations:")
+    print(f"      Initial loss: {initial_loss[0]:.6e}")
+    print(f"      Final loss:   {final_loss:.6e}")
+    print(f"      Improvement:  {improvement:.6e} ({improvement_pct:.2f}%)")
 
     # Return result as numpy array
     return x.detach().cpu().numpy()
