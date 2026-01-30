@@ -17,13 +17,6 @@ from dexp.processing.utils.linear_solver import linsolve
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
 
-# Import dexp Backend for GPU acceleration
-try:
-    from dexp.utils.backends import CupyBackend
-    _BACKEND_AVAILABLE = True
-except ImportError:
-    _BACKEND_AVAILABLE = False
-
 # Try to use CuPy for GPU-accelerated registration
 try:
     import cupy as xp
@@ -384,59 +377,30 @@ def optimal_positions(
     alpha_reg = 0
     maxiter = 1e8
 
-    # Use GPU backend if available (CuPy) for faster linear solve
-    if _BACKEND_AVAILABLE and _USING_CUPY:
-        print(f"optimizing positions (GPU-accelerated)")
-        with CupyBackend():
-            opt_i = linsolve(
-                a,
-                y_i,
-                tolerance=tolerance,
-                order_error=order_error,
-                order_reg=order_reg,
-                alpha_reg=alpha_reg,
-                x0=i_guess,
-                maxiter=maxiter,
-            )
-            opt_j = linsolve(
-                a,
-                y_j,
-                tolerance=tolerance,
-                order_error=order_error,
-                order_reg=order_reg,
-                alpha_reg=alpha_reg,
-                x0=j_guess,
-                maxiter=maxiter,
-            )
-    else:
-        print("optimizing positions (CPU)")
-        opt_i = linsolve(
-            a,
-            y_i,
-            tolerance=tolerance,
-            order_error=order_error,
-            order_reg=order_reg,
-            alpha_reg=alpha_reg,
-            x0=i_guess,
-            maxiter=maxiter,
-        )
-        opt_j = linsolve(
-            a,
-            y_j,
-            tolerance=tolerance,
-            order_error=order_error,
-            order_reg=order_reg,
-            alpha_reg=alpha_reg,
-            x0=j_guess,
-            maxiter=maxiter,
-        )
-
-    # Convert results back to numpy if they're CuPy arrays
-    if _USING_CUPY and hasattr(opt_i, 'get'):
-        opt_i = opt_i.get()  # CuPy to NumPy
-    if _USING_CUPY and hasattr(opt_j, 'get'):
-        opt_j = opt_j.get()  # CuPy to NumPy
-
+    # Note: scipy sparse matrices work efficiently on CPU
+    # GPU acceleration would require converting to dense (memory intensive)
+    # or using cupyx.scipy.sparse (complex conversion)
+    print("optimizing positions")
+    opt_i = linsolve(
+        a,
+        y_i,
+        tolerance=tolerance,
+        order_error=order_error,
+        order_reg=order_reg,
+        alpha_reg=alpha_reg,
+        x0=i_guess,
+        maxiter=maxiter,
+    )
+    opt_j = linsolve(
+        a,
+        y_j,
+        tolerance=tolerance,
+        order_error=order_error,
+        order_reg=order_reg,
+        alpha_reg=alpha_reg,
+        x0=j_guess,
+        maxiter=maxiter,
+    )
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
     opt_shifts_zeroed = opt_shifts - np.min(opt_shifts, axis=0)
