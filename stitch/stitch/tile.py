@@ -385,45 +385,30 @@ def _linsolve_gpu(a_sparse, y, x0, tolerance, order_error, order_reg, alpha_reg,
         return objective
 
     # Create LBFGS optimizer
-    # PyTorch LBFGS needs more iterations for sparse linear system optimization
-    # Each outer iteration does max_iter (20) internal line search steps
-    max_outer_iters = min(5000, int(maxiter / 20))  # Allow up to 5000 outer iterations
+    # PyTorch LBFGS: max_iter controls INTERNAL iterations within each step() call
+    # We should call step() once or a few times, not thousands of times
+    # Set max_iter high to allow full convergence within a single step() call
+    max_iterations = min(20000, int(maxiter))  # Allow up to 20k iterations total
+
+    print(f"  Running PyTorch LBFGS (max {max_iterations} internal iterations)")
+
     optimizer = torch.optim.LBFGS(
         [x],
         lr=1.0,
-        max_iter=20,  # Per-step line search iterations
+        max_iter=max_iterations,  # Total iterations for the optimization
         tolerance_grad=tolerance,
-        tolerance_change=tolerance * 10,  # Relax change tolerance slightly
+        tolerance_change=tolerance,
         history_size=100,
         line_search_fn='strong_wolfe'
     )
 
-    # Optimization loop with progress output
-    print(f"  Running PyTorch LBFGS (max {max_outer_iters} iterations)")
-    prev_loss = None
-    for i in range(max_outer_iters):
-        loss = optimizer.step(closure)
-        loss_val = loss.item()
+    # Call step() once - PyTorch LBFGS handles all iterations internally
+    # The optimizer will run until convergence or max_iter
+    loss = optimizer.step(closure)
 
-        # Print progress every 100 iterations
-        if i % 100 == 0:
-            if prev_loss is not None:
-                change = abs(prev_loss - loss_val)
-                print(f"    Iteration {i}: loss = {loss_val:.6e}, change = {change:.6e}")
-            else:
-                print(f"    Iteration {i}: loss = {loss_val:.6e}")
-            prev_loss = loss_val
+    final_loss = loss.item()
+    print(f"    Optimization complete: final loss = {final_loss:.6e}")
 
-        # Check if loss change is below tolerance (manual convergence check)
-        if i > 0 and prev_loss is not None:
-            change = abs(prev_loss - loss_val)
-            if change < tolerance * 10:  # Converged when change is small
-                print(f"    Converged after {i} iterations (loss = {loss_val:.6e}, change = {change:.6e})")
-                break
-
-        prev_loss = loss_val
-
-    print(f"    Final loss = {loss_val:.6e}")
     # Return result as numpy array
     return x.detach().cpu().numpy()
 
