@@ -17,6 +17,13 @@ from dexp.processing.utils.linear_solver import linsolve
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
 
+# Import PyTorch for GPU-accelerated optimization
+try:
+    import torch
+    _TORCH_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    _TORCH_AVAILABLE = False
+
 # Try to use CuPy for GPU-accelerated registration
 try:
     import cupy as xp
@@ -336,6 +343,68 @@ def pairwise_shifts(
     return edge_list, confidence_dict
 
 
+def _linsolve_gpu(a_sparse, y, x0, tolerance, order_error, order_reg, alpha_reg, maxiter):
+    """GPU-accelerated linear solver using PyTorch LBFGS optimizer.
+
+    Solves the same optimization problem as dexp's linsolve but on GPU.
+    """
+    # Convert sparse matrix to dense and move to GPU
+    a_dense = torch.tensor(a_sparse.toarray(), dtype=torch.float32, device='cuda')
+    y_gpu = torch.tensor(y, dtype=torch.float32, device='cuda')
+    x0_gpu = torch.tensor(x0, dtype=torch.float32, device='cuda')
+
+    # Optimization variable
+    x = torch.nn.Parameter(x0_gpu.clone())
+
+    # Normalization factors (same as in dexp linsolve)
+    beta = (1.0 / y.shape[0]) ** (1.0 / order_error)
+    alpha = (1.0 / x0.shape[0]) ** (1.0 / order_reg)
+
+    # Define objective function
+    def closure():
+        optimizer.zero_grad()
+        residual = a_dense @ x - y_gpu
+
+        if order_error == 1:
+            objective = beta * torch.norm(residual, p=1)
+        elif order_error == 2:
+            objective = beta * torch.norm(residual, p=2)
+        else:
+            objective = beta * torch.norm(residual, p=order_error)
+
+        if alpha_reg > 0:
+            if order_reg == 1:
+                reg_term = (alpha_reg * alpha) * torch.norm(x, p=1)
+            elif order_reg == 2:
+                reg_term = (alpha_reg * alpha) * torch.norm(x, p=2)
+            else:
+                reg_term = (alpha_reg * alpha) * torch.norm(x, p=order_reg)
+            objective = objective + reg_term
+
+        objective.backward()
+        return objective
+
+    # Create LBFGS optimizer
+    optimizer = torch.optim.LBFGS(
+        [x],
+        lr=1.0,
+        max_iter=20,  # Per-step iterations
+        tolerance_grad=tolerance,
+        tolerance_change=tolerance,
+        history_size=100,
+        line_search_fn='strong_wolfe'
+    )
+
+    # Optimization loop
+    for i in range(int(maxiter / 20)):  # Outer loop
+        loss = optimizer.step(closure)
+        if loss.item() < tolerance:
+            break
+
+    # Return result as numpy array
+    return x.detach().cpu().numpy()
+
+
 def optimal_positions(
     edge_list: List,
     tile_lut: Dict,
@@ -377,27 +446,71 @@ def optimal_positions(
     alpha_reg = 0
     maxiter = 1e8
 
-    print("optimizing positions")
-    opt_i = linsolve(
-        a,
-        y_i,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=i_guess,
-        maxiter=maxiter,
-    )
-    opt_j = linsolve(
-        a,
-        y_j,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=j_guess,
-        maxiter=maxiter,
-    )
+    # Try GPU-accelerated optimization with PyTorch if available
+    if _TORCH_AVAILABLE and _USING_CUPY:
+        try:
+            print("optimizing positions (GPU-accelerated with PyTorch LBFGS)")
+            opt_i = _linsolve_gpu(
+                a, y_i, i_guess,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                maxiter=maxiter
+            )
+            opt_j = _linsolve_gpu(
+                a, y_j, j_guess,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                maxiter=maxiter
+            )
+        except Exception as e:
+            print(f"GPU optimization failed ({e}), falling back to CPU")
+            opt_i = linsolve(
+                a,
+                y_i,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                x0=i_guess,
+                maxiter=maxiter,
+            )
+            opt_j = linsolve(
+                a,
+                y_j,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                x0=j_guess,
+                maxiter=maxiter,
+            )
+    else:
+        print("optimizing positions (CPU)")
+        opt_i = linsolve(
+            a,
+            y_i,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=i_guess,
+            maxiter=maxiter,
+        )
+        opt_j = linsolve(
+            a,
+            y_j,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=j_guess,
+            maxiter=maxiter,
+        )
+
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
     opt_shifts_zeroed = opt_shifts - np.min(opt_shifts, axis=0)
