@@ -385,6 +385,9 @@ def _linsolve_gpu(a_sparse, y, x0, tolerance, order_error, order_reg, alpha_reg,
         return objective
 
     # Create LBFGS optimizer
+    # LBFGS typically converges in 100-1000 iterations for well-conditioned problems
+    # Use reasonable limits instead of the 1e8 maxiter from scipy version
+    max_outer_iters = min(1000, int(maxiter / 20))  # Cap at 1000 outer iterations
     optimizer = torch.optim.LBFGS(
         [x],
         lr=1.0,
@@ -395,10 +398,18 @@ def _linsolve_gpu(a_sparse, y, x0, tolerance, order_error, order_reg, alpha_reg,
         line_search_fn='strong_wolfe'
     )
 
-    # Optimization loop
-    for i in range(int(maxiter / 20)):  # Outer loop
+    # Optimization loop with progress output
+    print(f"  Running PyTorch LBFGS (max {max_outer_iters} iterations)")
+    for i in range(max_outer_iters):
         loss = optimizer.step(closure)
-        if loss.item() < tolerance:
+        loss_val = loss.item()
+
+        # Print progress every 50 iterations
+        if i % 50 == 0:
+            print(f"    Iteration {i}: loss = {loss_val:.6e}")
+
+        if loss_val < tolerance:
+            print(f"    Converged after {i} iterations (loss = {loss_val:.6e})")
             break
 
     # Return result as numpy array
