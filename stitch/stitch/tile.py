@@ -7,6 +7,7 @@ from typing import List, Dict
 from tqdm import tqdm
 import scipy
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
@@ -15,6 +16,13 @@ from dexp.processing.registration import translation_nd as dexp_reg
 from dexp.processing.utils.linear_solver import linsolve
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
+
+# Import dexp Backend for GPU acceleration
+try:
+    from dexp.utils.backends import CupyBackend
+    _BACKEND_AVAILABLE = True
+except ImportError:
+    _BACKEND_AVAILABLE = False
 
 # Try to use CuPy for GPU-accelerated registration
 try:
@@ -272,6 +280,22 @@ def offset(
     return model
 
 
+def _process_edge_pair(key, pos, tile_cache, overlap):
+    """Worker function to process a single edge pair."""
+    edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
+
+    # positions need to be not np.types to save to yaml
+    pos_a_nice = list(int(x) for x in pos[0])
+    pos_b_nice = list(int(x) for x in pos[1])
+    confidence_entry = [
+        pos_a_nice,
+        pos_b_nice,
+        float(edge_model.model.confidence),
+    ]
+
+    return key, edge_model, confidence_entry
+
+
 def pairwise_shifts(
     positions: List,
     store_path: str,
@@ -280,6 +304,7 @@ def pairwise_shifts(
     fliplr: bool,
     rot90: bool,
     overlap: int = 150,
+    max_workers: int = 16,
 ) -> List:
     """ """
     # get neighboring tiles
@@ -296,20 +321,24 @@ def pairwise_shifts(
     )
 
     edge_list = []
-    edge_list = []
     confidence_dict = {}
-    for key, pos in tqdm(edges_hilbert.items()):
-        edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
-        edge_list.append(edge_model)
 
-        # positions need to be not np.types to save to yaml
-        pos_a_nice = list(int(x) for x in pos[0])
-        pos_b_nice = list(int(x) for x in pos[1])
-        confidence_dict[key] = [
-            pos_a_nice,
-            pos_b_nice,
-            float(edge_model.model.confidence),
-        ]
+    # Parallel processing of edge pairs using ThreadPoolExecutor
+    num_edges = len(edges_hilbert)
+    print(f"[pairwise_shifts] Processing {num_edges} edge pairs with {max_workers} workers")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all edge pair computations
+        futures = {
+            executor.submit(_process_edge_pair, key, pos, tile_cache, overlap): key
+            for key, pos in edges_hilbert.items()
+        }
+
+        # Collect results with progress bar
+        for future in tqdm(as_completed(futures), total=num_edges, desc="Computing edge shifts"):
+            key, edge_model, confidence_entry = future.result()
+            edge_list.append(edge_model)
+            confidence_dict[key] = confidence_entry
 
     return edge_list, confidence_dict
 
@@ -354,27 +383,60 @@ def optimal_positions(
     order_reg = 1
     alpha_reg = 0
     maxiter = 1e8
-    print("optimizing positions")
-    opt_i = linsolve(
-        a,
-        y_i,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=i_guess,
-        maxiter=maxiter,
-    )
-    opt_j = linsolve(
-        a,
-        y_j,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=j_guess,
-        maxiter=maxiter,
-    )
+
+    # Use GPU backend if available (CuPy) for faster linear solve
+    if _BACKEND_AVAILABLE and _USING_CUPY:
+        print(f"optimizing positions (GPU-accelerated)")
+        with CupyBackend():
+            opt_i = linsolve(
+                a,
+                y_i,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                x0=i_guess,
+                maxiter=maxiter,
+            )
+            opt_j = linsolve(
+                a,
+                y_j,
+                tolerance=tolerance,
+                order_error=order_error,
+                order_reg=order_reg,
+                alpha_reg=alpha_reg,
+                x0=j_guess,
+                maxiter=maxiter,
+            )
+    else:
+        print("optimizing positions (CPU)")
+        opt_i = linsolve(
+            a,
+            y_i,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=i_guess,
+            maxiter=maxiter,
+        )
+        opt_j = linsolve(
+            a,
+            y_j,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=j_guess,
+            maxiter=maxiter,
+        )
+
+    # Convert results back to numpy if they're CuPy arrays
+    if _USING_CUPY and hasattr(opt_i, 'get'):
+        opt_i = opt_i.get()  # CuPy to NumPy
+    if _USING_CUPY and hasattr(opt_j, 'get'):
+        opt_j = opt_j.get()  # CuPy to NumPy
+
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
     opt_shifts_zeroed = opt_shifts - np.min(opt_shifts, axis=0)

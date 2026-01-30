@@ -971,26 +971,45 @@ def estimate_stitch(
         group = a[:3]
         grouped_positions[group].append(a)
 
-    running_opt_shift_dict = {}
-    running_confidence_dict = {}
-    for g in grouped_positions.keys():
-        well_positions = grouped_positions[g]
+    def _process_well(well_id):
+        """Worker function to process a single well."""
+        well_positions = grouped_positions[well_id]
         tile_lut = {t[4:]: i for i, t in enumerate(well_positions)}
 
         edge_list, confidence_dict = pairwise_shifts(
             well_positions,
             input_store_path,
-            well=g,
+            well=well_id,
             flipud=flipud,
             fliplr=fliplr,
             rot90=rot90,
             overlap=overlap,
         )
 
-        opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size, x_guess)
+        opt_shift_dict = optimal_positions(edge_list, tile_lut, well_id, tile_size, x_guess)
 
-        running_opt_shift_dict = running_opt_shift_dict | opt_shift_dict
-        running_confidence_dict[g] = confidence_dict
+        return well_id, opt_shift_dict, confidence_dict
+
+    running_opt_shift_dict = {}
+    running_confidence_dict = {}
+
+    # Parallel processing of wells using ThreadPoolExecutor
+    num_wells = len(grouped_positions)
+    max_workers = min(4, num_wells)  # Use up to 4 parallel wells
+    print(f"[estimate_stitch] Processing {num_wells} wells with {max_workers} parallel workers")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all well computations
+        futures = {
+            executor.submit(_process_well, well_id): well_id
+            for well_id in grouped_positions.keys()
+        }
+
+        # Collect results
+        for future in tqdm(as_completed(futures), total=num_wells, desc="Processing wells"):
+            well_id, opt_shift_dict, confidence_dict = future.result()
+            running_opt_shift_dict = running_opt_shift_dict | opt_shift_dict
+            running_confidence_dict[well_id] = confidence_dict
 
     to_write = {
         "total_translation": running_opt_shift_dict,
