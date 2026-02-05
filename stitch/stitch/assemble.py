@@ -18,98 +18,24 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
+from joblib import Parallel, delayed
 
-# Try to use CuPy for GPU acceleration, fall back to NumPy
-try:
-    import cupy as xp
-    from cupyx.scipy import ndimage as cundi
-    # Check if GPU is actually available at runtime
-    try:
-        _ = xp.array([1.0])  # Test GPU access
-        _USING_CUPY = True
-        print("[assemble.py] Using CuPy (GPU) for array operations")
-    except Exception as e:
-        # CuPy imported but no GPU available - fallback to CPU
-        print(f"[assemble.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
-        import numpy as xp
-        from scipy import ndimage as cundi
-        _USING_CUPY = False
-except (ModuleNotFoundError, ImportError):
-    import numpy as xp
-    from scipy import ndimage as cundi
-    _USING_CUPY = False
-    print("[assemble.py] Using NumPy (CPU) for array operations")
-
-def _to_numpy(arr):
-    """Convert array to NumPy (transfers from GPU to CPU if needed)."""
-    if _USING_CUPY and isinstance(arr, xp.ndarray):
-        # Use synchronous transfer for correctness
-        return xp.asnumpy(arr)
-    return np.asarray(arr)
-
-def _load_to_gpu_async(data):
-    """Load data to GPU asynchronously if using CuPy."""
-    if _USING_CUPY:
-        # Use default stream for async transfer
-        return xp.asarray(data)
-    return xp.asarray(data)
-
-# Cache for EDT-based blending weight maps to avoid recomputation per tile size/exponent
-_EDT_WEIGHT_CACHE: Dict[Tuple[int, int, int], xp.ndarray] = {}
-
-
-def _get_optimal_block_size(final_shape, tile_size, default_size=(1024, 1024)):
-    """
-    Determine optimal block size based on available GPU memory.
-
-    Args:
-        final_shape: Full output shape (T, C, Z, Y, X)
-        tile_size: Individual tile size (Y, X)
-        default_size: Default block size if GPU not available
-
-    Returns:
-        Tuple of (block_y, block_x) sizes
-    """
-    if not _USING_CUPY:
-        return default_size
-
-    try:
-        # Get GPU memory info
-        mempool = xp.get_default_memory_pool()
-        device = xp.cuda.Device()
-        free_mem, total_mem = xp.cuda.runtime.memGetInfo()
-
-        # Estimate memory needed per block
-        # We need: numer + denom buffers, plus tile cache
-        dtype_size = 2  # float16
-        tcz_size = final_shape[0] * final_shape[1] * final_shape[2]
-
-        # Use 40% of free memory for block processing (conservative)
-        target_mem = free_mem * 0.4
-
-        # Calculate block size that fits in memory
-        # memory = tcz_size * block_y * block_x * dtype_size * 2 (numer + denom)
-        # Add buffer for tile cache
-        block_pixels_max = target_mem / (tcz_size * dtype_size * 3)  # 3x for safety margin
-
-        # Start with max tile dimension and find largest power-of-2 block
-        max_dim = max(tile_size)
-        block_size = min(4096, max_dim)  # Cap at 4096
-
-        while block_size * block_size > block_pixels_max and block_size > 512:
-            block_size //= 2
-
-        block_size = max(512, block_size)  # Minimum 512
-        block_size = min(block_size, final_shape[-2], final_shape[-1])  # Don't exceed image size
-
-        print(f"[GPU Memory] Free: {free_mem / 1e9:.2f} GB, Total: {total_mem / 1e9:.2f} GB")
-        print(f"[GPU Memory] Using block size: {block_size}x{block_size}")
-
-        return (block_size, block_size)
-
-    except Exception as e:
-        print(f"[GPU Memory] Could not determine optimal block size: {e}. Using default.")
-        return default_size
+# Import GPU/CPU abstraction and helper functions from utils
+from stitch.stitch.utils import (
+    xp,
+    cundi,
+    _USING_CUPY,
+    _EDT_WEIGHT_CACHE,
+    _to_numpy,
+    _load_to_gpu_async,
+    _get_optimal_workers,
+    _discover_positions_fast,
+    find_contributing_fovs_yx,
+    _get_optimal_block_size,
+    _resolve_value_dtype,
+    _resolve_shift_dtype,
+    get_output_shape,
+)
 
 
 def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype_val, use_edt, tile_weights, stream=None):
@@ -174,91 +100,6 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
         del numer, denom, norm
 
         return norm_cpu
-
-
-def _resolve_value_dtype(value_precision_bits: int):
-    """Return a numpy dtype for requested float precision (16/32/64)."""
-    bits = int(value_precision_bits)
-    if bits == 16:
-        return xp.float16
-    if bits == 64:
-        return xp.float64
-    return xp.float32
-
-
-def _resolve_shift_dtype(shifts: dict, tile_size: tuple, base_bits: int = 32):
-    """Return an integer dtype for pixel shift indices with safety promotion.
-
-    Starts at base_bits (16/32 supported) and promotes to int64 if min/max
-    shifts plus tile_size would overflow the chosen dtype.
-    """
-    # Choose starting dtype
-    if int(base_bits) == 16:
-        dtype_idx = xp.int16
-    else:
-        dtype_idx = xp.int32
-
-    try:
-        info = np.iinfo(np.dtype(dtype_idx))
-        min_allowed = int(info.min)
-        max_allowed = int(info.max)
-        if shifts:
-            y_shifts = [int(s[0]) for s in shifts.values()]
-            x_shifts = [int(s[1]) for s in shifts.values()]
-            min_y_shift = min(y_shifts)
-            min_x_shift = min(x_shifts)
-            max_y_shift = max(y_shifts)
-            max_x_shift = max(x_shifts)
-        else:
-            min_y_shift = min_x_shift = 0
-            max_y_shift = max_x_shift = 0
-        end_y = max_y_shift + int(tile_size[0])
-        end_x = max_x_shift + int(tile_size[1])
-        needs_promo = (
-            min_y_shift < min_allowed
-            or min_x_shift < min_allowed
-            or end_y > max_allowed
-            or end_x > max_allowed
-        )
-        if needs_promo:
-            # Promote stepwise to int32 then int64 depending on start
-            if dtype_idx == xp.int16:
-                print(
-                    "WARNING: shift index range exceeds int16; promoting shifts to int32."
-                )
-                dtype_idx = xp.int32
-                info2 = np.iinfo(np.int32)
-                if (
-                    min_y_shift < int(info2.min)
-                    or min_x_shift < int(info2.min)
-                    or end_y > int(info2.max)
-                    or end_x > int(info2.max)
-                ):
-                    print(
-                        "WARNING: shift index range exceeds int32; promoting shifts to int64."
-                    )
-                    dtype_idx = xp.int64
-            else:
-                print(
-                    "WARNING: shift index range exceeds int32; promoting shifts to int64."
-                )
-                dtype_idx = xp.int64
-    except Exception:
-        # Best-effort: fall back to int64 when any check fails
-        dtype_idx = xp.int64
-
-    return dtype_idx
-
-
-def get_output_shape(shifts: dict, tile_size: tuple) -> tuple:
-    """Get the output shape of the stitched image from the raw shifts"""
-
-    x_shifts = [shift[0] for shift in shifts.values()]
-    y_shifts = [shift[1] for shift in shifts.values()]
-    max_x = int(xp.max(xp.asarray(x_shifts)))
-    max_y = int(xp.max(xp.asarray(y_shifts)))
-
-    return max_x + tile_size[0], max_y + tile_size[1]
 
 
 def assemble(
@@ -475,6 +316,10 @@ def assemble_streaming(
     divide_tile_size: Optional[Tuple[int, int]] = (1024, 1024),
     use_adaptive_blocks: bool = True,
     parallel_x_blocks: bool = True,
+    debug_zero_mask: bool = False,
+    per_channel_edt: bool = True,
+    parallel_y_bands: bool = False,
+    n_workers: Optional[int] = None,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -484,6 +329,10 @@ def assemble_streaming(
     Args:
         use_adaptive_blocks: If True, automatically determine optimal block size based on GPU memory
         parallel_x_blocks: If True, process X blocks in parallel using CUDA streams (GPU only)
+        debug_zero_mask: If True, print debug info about zero mask statistics
+        per_channel_edt: If True, compute EDT weights per-channel based on nonzero mask (data-driven)
+        parallel_y_bands: If True, process Y-bands in parallel using joblib (CPU only, ignored for GPU)
+        n_workers: Number of workers for parallel Y-band processing. If None, uses _get_optimal_workers()
     """
     print(f"[assemble.streaming] Using blending_method: {blending_method}")
     print(f"[assemble.streaming] Adaptive blocks: {use_adaptive_blocks}, Parallel X-blocks: {parallel_x_blocks}")
@@ -581,74 +430,339 @@ def assemble_streaming(
         ]
         y_bands.append((y0, y1, y_tiles))
 
-    for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
+    # Inner function to process a single Y-band (can be called in parallel)
+    def _process_y_band(band_idx: int, y0: int, y1: int, y_tiles: list):
+        """Process a single Y-band - loads tiles, processes X-blocks, writes to output."""
         t_band_start = time.time()
 
-        # Load all tiles for this Y-band to GPU in parallel
+        # Load all tiles for this Y-band
         t_load_start = time.time()
         tile_cache = {}
 
-        def load_single_tile(tile_meta):
+        def load_single_tile(tile_meta_item):
             """Load and augment a single tile."""
-            tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
+            tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta_item
             tile_full = fov_store[tile_name].data
-            # Transfer to GPU immediately after loading
-            tile_gpu = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
-            return tile_name, (tile_gpu, t_end, c_end, z_end, ys, ye, xs, xe)
+            tile_arr = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
+            return tile_name, (tile_arr, t_end, c_end, z_end, ys, ye, xs, xe)
 
         # Load tiles in parallel using ThreadPoolExecutor
-        # Zarr I/O releases GIL, so threads work well for parallel loading
-        # Limited to 6 workers to balance speed and GPU memory (requires 80GB+ GPU for 3 parallel wells)
         with ThreadPoolExecutor(max_workers=min(6, len(y_tiles))) as executor:
-            futures = {executor.submit(load_single_tile, tile_meta): tile_meta[0]
-                      for tile_meta in y_tiles}
+            futures = {executor.submit(load_single_tile, tm): tm[0] for tm in y_tiles}
             for future in as_completed(futures):
                 tile_name, tile_data = future.result()
                 tile_cache[tile_name] = tile_data
 
         t_load_elapsed = time.time() - t_load_start
-        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles in parallel: {t_load_elapsed:.2f}s")
+        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles: {t_load_elapsed:.2f}s")
 
-        # Optionally synchronize GPU before processing if using CuPy
+        # Synchronize GPU if using CuPy
         if _USING_CUPY:
             xp.cuda.Stream.null.synchronize()
 
         # Process all X blocks for this Y band
-        x_blocks = []
-        for x0 in range(0, total_x, tx):
-            x1 = min(total_x, x0 + tx)
-            x_blocks.append((x0, x1))
-
-        # Parallel X-block processing using CUDA streams (GPU only)
+        x_blocks = [(x0, min(total_x, x0 + tx)) for x0 in range(0, total_x, tx)]
         t_process_start = time.time()
-        if parallel_x_blocks and _USING_CUPY and len(x_blocks) > 1:
-            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks in parallel...")
 
-            # Create streams for parallel processing (limit to 4 concurrent streams)
-            num_streams = min(4, len(x_blocks))
-            streams = [xp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
+        # Sequential X-block processing (used for CPU and parallel Y-band mode)
+        for x0, x1 in x_blocks:
+            numer = xp.zeros(
+                (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
+                dtype=dtype_val,
+            )
+            denom = xp.zeros_like(numer, dtype=dtype_val)
 
-            # Process blocks in batches
-            for batch_start in range(0, len(x_blocks), num_streams):
-                batch_end = min(batch_start + num_streams, len(x_blocks))
-                batch_blocks = x_blocks[batch_start:batch_end]
+            for tile_name, t_end_t, c_end_t, z_end_t, ys_t, ye_t, xs_t, xe_t in y_tiles:
+                ix0 = max(x0, xs_t)
+                ix1 = min(x1, xe_t)
+                if ix0 >= ix1:
+                    continue
+                iy0 = max(y0, ys_t)
+                iy1 = min(y1, ye_t)
+                tile_full, t_end_c, c_end_c, z_end_c, ys_c, ye_c, xs_c, xe_c = tile_cache[tile_name]
+                tile_sl = (
+                    slice(0, t_end_c),
+                    slice(0, c_end_c),
+                    slice(0, z_end_c),
+                    slice(iy0 - ys_c, iy1 - ys_c),
+                    slice(ix0 - xs_c, ix1 - xs_c),
+                )
+                block = tile_full[tile_sl].astype(dtype_val, copy=False)
 
-                # Launch processing on streams
-                results = []
-                for idx, (x0, x1) in enumerate(batch_blocks):
-                    stream = streams[idx % num_streams]
-                    norm_cpu = _process_x_block_gpu(
-                        x0, x1, y0, y1, y_tiles, tile_cache, final_shape,
-                        dtype_val, use_edt, tile_weights, stream
+                if use_edt and per_channel_edt:
+                    for c_idx in range(c_end_c):
+                        ch_out_sl = (
+                            slice(0, t_end_c),
+                            slice(c_idx, c_idx + 1),
+                            slice(0, z_end_c),
+                            slice(iy0 - y0, iy1 - y0),
+                            slice(ix0 - x0, ix1 - x0),
+                        )
+                        block_ch = block[:, c_idx : c_idx + 1, :, :, :]
+                        nz2d = xp.any(block[:, c_idx, :, :, :] != 0, axis=(0, 1))
+
+                        if debug_zero_mask:
+                            total_px = nz2d.size
+                            nonzero_px = int(xp.count_nonzero(nz2d))
+                            print(f"    [debug] tile={tile_name} ch={c_idx}: {nonzero_px}/{total_px} nonzero")
+
+                        if not xp.any(nz2d):
+                            continue
+
+                        if int(xp.count_nonzero(nz2d)) == nz2d.size:
+                            wloc2d = tile_weights[iy0 - ys_c : iy1 - ys_c, ix0 - xs_c : ix1 - xs_c]
+                        else:
+                            _dist = cundi.distance_transform_edt(nz2d).astype(np.float32)
+                            _dist += 1e-6
+                            wloc2d = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                            wloc2d = xp.asarray(wloc2d, dtype=dtype_val)
+
+                        wloc5 = wloc2d[None, None, None, :, :]
+                        numer[ch_out_sl] += (block_ch.astype(xp.float32) * wloc5).astype(dtype_val)
+                        denom[ch_out_sl] += wloc5
+
+                elif use_edt:
+                    out_sl = (
+                        slice(0, t_end_c),
+                        slice(0, c_end_c),
+                        slice(0, z_end_c),
+                        slice(iy0 - y0, iy1 - y0),
+                        slice(ix0 - x0, ix1 - x0),
                     )
-                    results.append((x0, x1, norm_cpu))
+                    wloc = tile_weights[(iy0 - ys_c) : (iy1 - ys_c), (ix0 - xs_c) : (ix1 - xs_c)]
+                    wloc = xp.asarray(wloc, dtype=dtype_val)
+                    nz = block != 0
+                    wloc = wloc * nz
+                    numer[out_sl] += block * wloc
+                    denom[out_sl] += wloc
+                else:
+                    out_sl = (
+                        slice(0, t_end_c),
+                        slice(0, c_end_c),
+                        slice(0, z_end_c),
+                        slice(iy0 - y0, iy1 - y0),
+                        slice(ix0 - x0, ix1 - x0),
+                    )
+                    numer[out_sl] += block
+                    denom[out_sl] += (block != 0).astype(dtype_val)
 
-                # Synchronize streams before writing
-                for stream in streams[:len(batch_blocks)]:
-                    stream.synchronize()
+            # Normalize and write this block
+            norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+            norm_cpu = _to_numpy(norm)
+            arr_out[
+                (
+                    slice(0, final_shape[0]),
+                    slice(0, final_shape[1]),
+                    slice(0, final_shape[2]),
+                    slice(y0, y1),
+                    slice(x0, x1),
+                )
+            ] = norm_cpu
+            del numer, denom, norm, norm_cpu
 
-                # Write results sequentially (I/O is sequential anyway)
-                for x0, x1, norm_cpu in results:
+        t_process_elapsed = time.time() - t_process_start
+        tile_cache.clear()
+        t_band_elapsed = time.time() - t_band_start
+        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
+
+    # Decide whether to use parallel Y-band processing
+    use_parallel_y = parallel_y_bands and not _USING_CUPY
+    if use_parallel_y:
+        workers = n_workers if n_workers is not None else _get_optimal_workers(use_gpu=False, verbose=True)
+        print(f"[assemble.streaming] Parallel Y-bands enabled with {workers} workers (CPU mode)")
+        Parallel(n_jobs=workers, backend="threading")(
+            delayed(_process_y_band)(band_idx, y0, y1, y_tiles)
+            for band_idx, (y0, y1, y_tiles) in enumerate(y_bands)
+        )
+    else:
+        # Sequential or GPU mode - use original loop with GPU optimizations
+        for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
+            t_band_start = time.time()
+
+            # Load all tiles for this Y-band to GPU in parallel
+            t_load_start = time.time()
+            tile_cache = {}
+
+            def load_single_tile(tile_meta):
+                """Load and augment a single tile."""
+                tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
+                tile_full = fov_store[tile_name].data
+                # Transfer to GPU immediately after loading
+                tile_gpu = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
+                return tile_name, (tile_gpu, t_end, c_end, z_end, ys, ye, xs, xe)
+
+            # Load tiles in parallel using ThreadPoolExecutor
+            # Zarr I/O releases GIL, so threads work well for parallel loading
+            # Limited to 6 workers to balance speed and GPU memory (requires 80GB+ GPU for 3 parallel wells)
+            with ThreadPoolExecutor(max_workers=min(6, len(y_tiles))) as executor:
+                futures = {executor.submit(load_single_tile, tile_meta): tile_meta[0]
+                          for tile_meta in y_tiles}
+                for future in as_completed(futures):
+                    tile_name, tile_data = future.result()
+                    tile_cache[tile_name] = tile_data
+
+            t_load_elapsed = time.time() - t_load_start
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles in parallel: {t_load_elapsed:.2f}s")
+
+            # Optionally synchronize GPU before processing if using CuPy
+            if _USING_CUPY:
+                xp.cuda.Stream.null.synchronize()
+
+            # Process all X blocks for this Y band
+            x_blocks = []
+            for x0 in range(0, total_x, tx):
+                x1 = min(total_x, x0 + tx)
+                x_blocks.append((x0, x1))
+
+            # Parallel X-block processing using CUDA streams (GPU only)
+            t_process_start = time.time()
+            if parallel_x_blocks and _USING_CUPY and len(x_blocks) > 1:
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks in parallel...")
+
+                # Create streams for parallel processing (limit to 4 concurrent streams)
+                num_streams = min(4, len(x_blocks))
+                streams = [xp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
+
+                # Process blocks in batches
+                for batch_start in range(0, len(x_blocks), num_streams):
+                    batch_end = min(batch_start + num_streams, len(x_blocks))
+                    batch_blocks = x_blocks[batch_start:batch_end]
+
+                    # Launch processing on streams
+                    results = []
+                    for idx, (x0, x1) in enumerate(batch_blocks):
+                        stream = streams[idx % num_streams]
+                        norm_cpu = _process_x_block_gpu(
+                            x0, x1, y0, y1, y_tiles, tile_cache, final_shape,
+                            dtype_val, use_edt, tile_weights, stream
+                        )
+                        results.append((x0, x1, norm_cpu))
+
+                    # Synchronize streams before writing
+                    for stream in streams[:len(batch_blocks)]:
+                        stream.synchronize()
+
+                    # Write results sequentially (I/O is sequential anyway)
+                    for x0, x1, norm_cpu in results:
+                        arr_out[
+                            (
+                                slice(0, final_shape[0]),
+                                slice(0, final_shape[1]),
+                                slice(0, final_shape[2]),
+                                slice(y0, y1),
+                                slice(x0, x1),
+                            )
+                        ] = norm_cpu
+                        del norm_cpu
+
+                    # Free GPU memory after batch
+                    if _USING_CUPY:
+                        xp.get_default_memory_pool().free_all_blocks()
+
+                t_process_elapsed = time.time() - t_process_start
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s")
+
+            else:
+                # Sequential processing (fallback or CPU)
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks sequentially...")
+                for x0, x1 in x_blocks:
+                    numer = xp.zeros(
+                        (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
+                        dtype=dtype_val,
+                    )
+                    denom = xp.zeros_like(numer, dtype=dtype_val)
+
+                    for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
+                        # X intersection within this block
+                        ix0 = max(x0, xs)
+                        ix1 = min(x1, xe)
+                        if ix0 >= ix1:
+                            continue
+                        iy0 = max(y0, ys)
+                        iy1 = min(y1, ye)
+                        tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+                        tile_sl = (
+                            slice(0, t_end),
+                            slice(0, c_end),
+                            slice(0, z_end),
+                            slice(iy0 - ys, iy1 - ys),
+                            slice(ix0 - xs, ix1 - xs),
+                        )
+                        block = tile_full[tile_sl].astype(dtype_val, copy=False)
+
+                        if use_edt and per_channel_edt:
+                            # Per-channel EDT: compute weights based on each channel's nonzero mask
+                            for c_idx in range(c_end):
+                                ch_out_sl = (
+                                    slice(0, t_end),
+                                    slice(c_idx, c_idx + 1),
+                                    slice(0, z_end),
+                                    slice(iy0 - y0, iy1 - y0),
+                                    slice(ix0 - x0, ix1 - x0),
+                                )
+                                block_ch = block[:, c_idx : c_idx + 1, :, :, :]
+                                # Collapse T and Z for a 2D nonzero mask (Y, X)
+                                nz2d = xp.any(block[:, c_idx, :, :, :] != 0, axis=(0, 1))
+
+                                if debug_zero_mask:
+                                    total_px = nz2d.size
+                                    nonzero_px = int(xp.count_nonzero(nz2d))
+                                    zero_px = int(total_px - nonzero_px)
+                                    print(f"    [debug] tile={tile_name} ch={c_idx}: {nonzero_px}/{total_px} nonzero ({zero_px} zeros)")
+
+                                if not xp.any(nz2d):
+                                    # No signal for this channel in this intersection
+                                    continue
+
+                                # If mask is fully non-zero, use structural weights
+                                if int(xp.count_nonzero(nz2d)) == nz2d.size:
+                                    wloc2d = tile_weights[iy0 - ys : iy1 - ys, ix0 - xs : ix1 - xs]
+                                else:
+                                    # Compute EDT on actual nonzero mask (data-driven)
+                                    _dist = cundi.distance_transform_edt(nz2d).astype(np.float32)
+                                    _dist += 1e-6
+                                    wloc2d = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                                    wloc2d = xp.asarray(wloc2d, dtype=dtype_val)
+
+                                # Expand to (T, 1, Z, Y, X) by broadcasting
+                                wloc5 = wloc2d[None, None, None, :, :]
+                                # Cast to float32 before multiplication to prevent overflow with uint16
+                                numer[ch_out_sl] += (block_ch.astype(xp.float32) * wloc5).astype(dtype_val)
+                                denom[ch_out_sl] += wloc5
+
+                        elif use_edt:
+                            # Standard EDT: use structural weights for all channels
+                            out_sl = (
+                                slice(0, t_end),
+                                slice(0, c_end),
+                                slice(0, z_end),
+                                slice(iy0 - y0, iy1 - y0),
+                                slice(ix0 - x0, ix1 - x0),
+                            )
+                            wloc = tile_weights[
+                                (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
+                            ]
+                            wloc = xp.asarray(wloc, dtype=dtype_val)
+                            nz = block != 0
+                            wloc = wloc * nz
+                            numer[out_sl] += block * wloc
+                            denom[out_sl] += wloc
+                        else:
+                            # Average blending
+                            out_sl = (
+                                slice(0, t_end),
+                                slice(0, c_end),
+                                slice(0, z_end),
+                                slice(iy0 - y0, iy1 - y0),
+                                slice(ix0 - x0, ix1 - x0),
+                            )
+                            numer[out_sl] += block
+                            denom[out_sl] += (block != 0).astype(dtype_val)
+
+                    # Normalize and write this block
+                    norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+                    # Convert to NumPy for Zarr (transfers from GPU to CPU if using CuPy)
+                    norm_cpu = _to_numpy(norm)
                     arr_out[
                         (
                             slice(0, final_shape[0]),
@@ -658,104 +772,39 @@ def assemble_streaming(
                             slice(x0, x1),
                         )
                     ] = norm_cpu
-                    del norm_cpu
 
-                # Free GPU memory after batch
-                if _USING_CUPY:
-                    xp.get_default_memory_pool().free_all_blocks()
+                    # Free GPU memory immediately after writing
+                    del numer, denom, norm, norm_cpu
+                    if _USING_CUPY:
+                        xp.get_default_memory_pool().free_all_blocks()
 
-            t_process_elapsed = time.time() - t_process_start
-            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s")
+                t_process_elapsed = time.time() - t_process_start
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing: {t_process_elapsed:.2f}s")
 
-        else:
-            # Sequential processing (fallback or CPU)
-            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks sequentially...")
-            for x0, x1 in x_blocks:
-                numer = xp.zeros(
-                    (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
-                    dtype=dtype_val,
-                )
-                denom = xp.zeros_like(numer, dtype=dtype_val)
+            # Free cache for this Y band
+            tile_cache.clear()
+            if _USING_CUPY:
+                xp.get_default_memory_pool().free_all_blocks()
 
-                for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
-                    # X intersection within this block
-                    ix0 = max(x0, xs)
-                    ix1 = min(x1, xe)
-                    if ix0 >= ix1:
-                        continue
-                    iy0 = max(y0, ys)
-                    iy1 = min(y1, ye)
-                    tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
-                    out_sl = (
-                        slice(0, t_end),
-                        slice(0, c_end),
-                        slice(0, z_end),
-                        slice(iy0 - y0, iy1 - y0),
-                        slice(ix0 - x0, ix1 - x0),
-                    )
-                    tile_sl = (
-                        slice(0, t_end),
-                        slice(0, c_end),
-                        slice(0, z_end),
-                        slice(iy0 - ys, iy1 - ys),
-                        slice(ix0 - xs, ix1 - xs),
-                    )
-                    block = tile_full[tile_sl].astype(dtype_val, copy=False)
-                    if use_edt:
-                        wloc = tile_weights[
-                            (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
-                        ]
-                        wloc = xp.asarray(wloc, dtype=dtype_val)
-                        nz = block != 0
-                        wloc = wloc * nz
-                        numer[out_sl] += block * wloc
-                        denom[out_sl] += wloc
-                    else:
-                        numer[out_sl] += block
-                        denom[out_sl] += (block != 0).astype(dtype_val)
-
-                # Normalize and write this block
-                norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
-                # Convert to NumPy for Zarr (transfers from GPU to CPU if using CuPy)
-                norm_cpu = _to_numpy(norm)
-                arr_out[
-                    (
-                        slice(0, final_shape[0]),
-                        slice(0, final_shape[1]),
-                        slice(0, final_shape[2]),
-                        slice(y0, y1),
-                        slice(x0, x1),
-                    )
-                ] = norm_cpu
-
-                # Free GPU memory immediately after writing
-                del numer, denom, norm, norm_cpu
-                if _USING_CUPY:
-                    xp.get_default_memory_pool().free_all_blocks()
-
-            t_process_elapsed = time.time() - t_process_start
-            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing: {t_process_elapsed:.2f}s")
-
-        # Free cache for this Y band
-        tile_cache.clear()
-        if _USING_CUPY:
-            xp.get_default_memory_pool().free_all_blocks()
-
-        t_band_elapsed = time.time() - t_band_start
-        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
+            t_band_elapsed = time.time() - t_band_start
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
 
     return stitched_pos["0"]
 
 
 def _process_single_well(well_id, shifts, output_store, input_store_path, tile_shape,
                         flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
-                        well_lock):
+                        well_lock, parallel_y_bands=False, n_workers=None):
     """
     Process a single well for parallel stitching.
     Thread-safe helper function to stitch one well.
+
+    Args:
+        parallel_y_bands: If True, process Y-bands in parallel (CPU mode)
+        n_workers: Number of workers for parallel Y-band processing
     """
     try:
-        print(f"[Parallel Wells] Starting well {well_id}")
+        print(f"[Well Processing] Starting well {well_id}")
 
         # Thread-safe creation of stitched position
         with well_lock:
@@ -777,14 +826,18 @@ def _process_single_well(well_id, shifts, output_store, input_store_path, tile_s
             chunks_size=chunks_size,
             scale=scale,
             divide_tile_size=kwargs.get("target_chunks_yx", (1024, 1024)),
+            debug_zero_mask=kwargs.get("debug_zero_mask", False),
+            per_channel_edt=kwargs.get("per_channel_edt", True),
+            parallel_y_bands=parallel_y_bands,
+            n_workers=n_workers,
         )
 
         del stitched_pos  # free reference
-        print(f"[Parallel Wells] ✅ Completed well {well_id}")
+        print(f"[Well Processing] Completed well {well_id}")
         return well_id, True
 
     except Exception as e:
-        print(f"[Parallel Wells] ❌ Failed well {well_id}: {e}")
+        print(f"[Well Processing] Failed well {well_id}: {e}")
         return well_id, False
 
 
@@ -796,9 +849,26 @@ def stitch(
     fliplr: bool = False,
     rot90: int = 0,
     blending_method: Literal["average", "edt"] = "edt",
+    parallel_mode: Literal["auto", "wells", "y_bands", "sequential"] = "auto",
     **kwargs,
 ):
-    """Mimic of biahub stitch function"""
+    """Mimic of biahub stitch function
+
+    Args:
+        config_path: Path to the YAML config file with shift estimates
+        input_store_path: Path to the input OME-Zarr store
+        output_store_path: Path for the output stitched OME-Zarr store
+        flipud: Flip tiles vertically
+        fliplr: Flip tiles horizontally
+        rot90: Number of 90-degree rotations to apply
+        blending_method: 'average' or 'edt' for blending overlapping tiles
+        parallel_mode: Parallelization strategy:
+            - "auto" (default): GPU uses parallel wells, CPU uses parallel Y-bands
+            - "wells": Force parallel well processing (ThreadPoolExecutor)
+            - "y_bands": Force parallel Y-band processing (joblib)
+            - "sequential": No parallelization
+        **kwargs: Additional arguments passed to assemble_streaming()
+    """
 
     # get the shifts and split into a list of lists per well
     all_shifts = read_shifts_biahub(config_path)
@@ -840,53 +910,105 @@ def stitch(
     )
     print("output store created")
 
-    # PARALLEL WELL PROCESSING - Process wells in parallel using ThreadPoolExecutor
+    # Determine parallelization strategy based on parallel_mode and hardware
+    use_parallel_wells = False
+    use_parallel_y_bands = False
+    n_workers = None
+
+    if parallel_mode == "auto":
+        if _USING_CUPY:
+            use_parallel_wells = True  # GPU: parallel wells via ThreadPoolExecutor
+            print("[stitch] Auto mode: GPU detected, using parallel wells strategy")
+        else:
+            use_parallel_y_bands = True  # CPU: parallel Y-bands via joblib
+            n_workers = _get_optimal_workers(use_gpu=False, verbose=True)
+            print(f"[stitch] Auto mode: CPU detected, using parallel Y-bands strategy ({n_workers} workers)")
+    elif parallel_mode == "wells":
+        use_parallel_wells = True
+        print("[stitch] Forced parallel wells strategy")
+    elif parallel_mode == "y_bands":
+        use_parallel_y_bands = True
+        n_workers = _get_optimal_workers(use_gpu=False, verbose=True)
+        print(f"[stitch] Forced parallel Y-bands strategy ({n_workers} workers)")
+    else:  # "sequential"
+        print("[stitch] Sequential processing (no parallelization)")
+
     well_ids = list(grouped_shifts.keys())
     num_wells = len(well_ids)
-    max_workers = min(4, num_wells)  # Limit to 4 parallel wells to avoid resource contention
-
-    print(f"[Parallel Wells] Processing {num_wells} wells with {max_workers} parallel workers")
-    print(f"[Parallel Wells] Wells: {well_ids}")
 
     # Thread lock for thread-safe zarr store operations
     well_lock = threading.Lock()
 
-    # Use ThreadPoolExecutor for parallel well processing
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all well processing tasks
-        futures = []
-        for well_id in well_ids:
-            shifts = grouped_shifts[well_id]
-            future = executor.submit(
-                _process_single_well,
-                well_id, shifts, output_store, input_store_path, tile_shape,
-                flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
-                well_lock
-            )
-            futures.append((well_id, future))
+    if use_parallel_wells:
+        # PARALLEL WELL PROCESSING - Process wells in parallel using ThreadPoolExecutor
+        max_workers = min(4, num_wells)  # Limit to 4 parallel wells to avoid resource contention
 
-        # Wait for all wells to complete and collect results
+        print(f"[Parallel Wells] Processing {num_wells} wells with {max_workers} parallel workers")
+        print(f"[Parallel Wells] Wells: {well_ids}")
+
+        # Use ThreadPoolExecutor for parallel well processing
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all well processing tasks
+            futures = []
+            for well_id in well_ids:
+                shifts = grouped_shifts[well_id]
+                future = executor.submit(
+                    _process_single_well,
+                    well_id, shifts, output_store, input_store_path, tile_shape,
+                    flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
+                    well_lock, parallel_y_bands=False, n_workers=None
+                )
+                futures.append((well_id, future))
+
+            # Wait for all wells to complete and collect results
+            completed_wells = []
+            failed_wells = []
+
+            for well_id, future in futures:
+                try:
+                    result_well_id, success = future.result()
+                    if success:
+                        completed_wells.append(result_well_id)
+                    else:
+                        failed_wells.append(result_well_id)
+                except Exception as e:
+                    print(f"[Parallel Wells] Exception in well {well_id}: {e}")
+                    failed_wells.append(well_id)
+
+        # Report final results
+        print(f"[Parallel Wells] Completed: {len(completed_wells)} wells: {completed_wells}")
+        if failed_wells:
+            print(f"[Parallel Wells] Failed: {len(failed_wells)} wells: {failed_wells}")
+            raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
+
+        print(f"[Parallel Wells] All {num_wells} wells processed successfully!")
+
+    else:
+        # SEQUENTIAL WELL PROCESSING with optional parallel Y-bands
+        print(f"[Sequential Wells] Processing {num_wells} wells: {well_ids}")
+
         completed_wells = []
         failed_wells = []
 
-        for well_id, future in futures:
-            try:
-                result_well_id, success = future.result()
-                if success:
-                    completed_wells.append(result_well_id)
-                else:
-                    failed_wells.append(result_well_id)
-            except Exception as e:
-                print(f"[Parallel Wells] ❌ Exception in well {well_id}: {e}")
-                failed_wells.append(well_id)
+        for well_id in well_ids:
+            shifts = grouped_shifts[well_id]
+            result_well_id, success = _process_single_well(
+                well_id, shifts, output_store, input_store_path, tile_shape,
+                flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
+                well_lock, parallel_y_bands=use_parallel_y_bands, n_workers=n_workers
+            )
+            if success:
+                completed_wells.append(result_well_id)
+            else:
+                failed_wells.append(result_well_id)
 
-    # Report final results
-    print(f"[Parallel Wells] ✅ Completed: {len(completed_wells)} wells: {completed_wells}")
-    if failed_wells:
-        print(f"[Parallel Wells] ❌ Failed: {len(failed_wells)} wells: {failed_wells}")
-        raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
+        # Report final results
+        print(f"[Sequential Wells] Completed: {len(completed_wells)} wells: {completed_wells}")
+        if failed_wells:
+            print(f"[Sequential Wells] Failed: {len(failed_wells)} wells: {failed_wells}")
+            raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
 
-    print(f"[Parallel Wells] 🎉 All {num_wells} wells processed successfully!")
+        print(f"[Sequential Wells] All {num_wells} wells processed successfully!")
 
     return
 
@@ -901,11 +1023,30 @@ def estimate_stitch(
     overlap: int = 150,
     x_guess: Optional[dict] = None,
     limit_positions: Optional[int] = None,
+    channel: int = 0,
+    timepoint: int = 0,
+    timepoint_per_well: Optional[dict] = None,
+    use_clahe: bool = False,
+    clahe_clip_limit: float = 0.02,
+    verbose: bool = False,
 ):
-    """Mimic of Biahub estimate stitch function"""
+    """Mimic of Biahub estimate stitch function
+
+    Args:
+        channel: Channel index to use for registration (default: 0)
+        timepoint: Timepoint index to use for registration (default: 0)
+        timepoint_per_well: Optional dict mapping well names (e.g., "A/2") to timepoint indices.
+                           Overrides the default timepoint for specific wells.
+        use_clahe: Apply CLAHE preprocessing for better registration (default: False)
+        clahe_clip_limit: CLAHE contrast limit (default: 0.02)
+        verbose: Print confidence scores as edges are computed (default: False)
+    """
 
     store = open_ome_zarr(input_store_path)
-    print(f"[assemble.estimate_stitch] Using {limit_positions} positions")
+    if limit_positions is not None and int(limit_positions) > 0:
+        print(f"[assemble.estimate_stitch] DEBUG MODE: Limiting to {limit_positions} positions")
+    else:
+        print(f"[assemble.estimate_stitch] Processing ALL positions (full stitching)")
     # Discover positions with an optional centered selection to avoid scanning entire store in debug
     if limit_positions is not None and int(limit_positions) > 0:
         # Build a true centered m×m block for EACH well from the filesystem (no fallback)
@@ -961,10 +1102,17 @@ def estimate_stitch(
             f"[assemble.estimate_stitch] Using centered grid {side}x{side} per well; total tiles={len(position_list)}"
         )
     else:
-        # Full list (may be large)
-        position_list = [
-            p for p, _ in tqdm(store.positions(), desc="Getting positions")
-        ]
+        # Full list (may be large) - try fast discovery first
+        position_list = _discover_positions_fast(Path(input_store_path))
+
+        if position_list is not None:
+            print(f"[assemble.estimate_stitch] Fast discovery found {len(position_list)} positions")
+        else:
+            # Not HCS layout or fast discovery failed - use slower iterator
+            print(f"[assemble.estimate_stitch] Not HCS layout, falling back to iterator-based discovery")
+            position_list = [
+                p for p, _ in tqdm(store.positions(), desc="Getting positions")
+            ]
 
     grouped_positions = defaultdict(list)
     for a in position_list:
@@ -977,6 +1125,12 @@ def estimate_stitch(
         well_positions = grouped_positions[g]
         tile_lut = {t[4:]: i for i, t in enumerate(well_positions)}
 
+        # Determine timepoint for this well
+        well_timepoint = timepoint
+        if timepoint_per_well is not None and g in timepoint_per_well:
+            well_timepoint = timepoint_per_well[g]
+            print(f"[assemble.estimate_stitch] Using timepoint {well_timepoint} for well {g}")
+
         edge_list, confidence_dict = pairwise_shifts(
             well_positions,
             input_store_path,
@@ -985,6 +1139,11 @@ def estimate_stitch(
             fliplr=fliplr,
             rot90=rot90,
             overlap=overlap,
+            channel=channel,
+            timepoint=well_timepoint,
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            verbose=verbose,
         )
 
         opt_shift_dict = optimal_positions(edge_list, tile_lut, g, tile_size, x_guess)

@@ -1,12 +1,19 @@
+from __future__ import annotations
+
 import numpy as np
 from stitch import connect
 from collections import OrderedDict
 from iohub import open_ome_zarr
 import dask.array as da
-from typing import List, Dict
+from typing import List, Dict, TYPE_CHECKING
 from tqdm import tqdm
 import scipy
 from typing import Optional
+
+if TYPE_CHECKING:
+    from dexp.processing.registration.model.translation_registration_model import (
+        TranslationRegistrationModel,
+    )
 
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
@@ -90,13 +97,17 @@ class TileCache:
     - get_item
     """
 
-    def __init__(self, store_path, well, flipud, fliplr, rot90):
+    def __init__(self, store_path, well, flipud, fliplr, rot90, channel=0, timepoint=0, use_clahe=False, clahe_clip_limit=0.02):
         self.cache = LimitedSizeDict(max_size=20)
         self.store = open_ome_zarr(store_path)
         self.well = well
         self.flipud = flipud
         self.fliplr = fliplr
         self.rot90 = rot90
+        self.channel = channel
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.timepoint = timepoint
 
     def add(self, obj):
         """add an object to the cache"""
@@ -121,10 +132,20 @@ class TileCache:
         """load a tile and add it to the cache"""
         da_tile = da.from_array(self.store[f"{self.well}/{key}"].data)
 
+        tile = da_tile[self.timepoint, self.channel, 0, :, :].compute()  # T=timepoint, C=channel, Z=0
+
+        # Apply CLAHE preprocessing if enabled
+        if self.use_clahe:
+            from skimage.exposure import equalize_adapthist
+            # Normalize to [0, 1] for CLAHE
+            tile_min, tile_max = np.percentile(tile, [1, 99])
+            tile_norm = np.clip((tile.astype(np.float32) - tile_min) / (tile_max - tile_min + 1e-8), 0, 1)
+            # Apply CLAHE with default kernel size (1/8 of image size)
+            tile = equalize_adapthist(tile_norm, clip_limit=self.clahe_clip_limit)
+            # Keep as float [0, 1]
+
         aug_tile = augment_tile(
-            da_tile[
-                0, 0, 0, :, :
-            ].compute(),  # TODO: hardcoded to 2D # TODO: changed to 100!
+            tile,
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
@@ -280,6 +301,11 @@ def pairwise_shifts(
     fliplr: bool,
     rot90: bool,
     overlap: int = 150,
+    channel: int = 0,
+    timepoint: int = 0,
+    use_clahe: bool = False,
+    clahe_clip_limit: float = 0.02,
+    verbose: bool = False,
 ) -> List:
     """ """
     # get neighboring tiles
@@ -293,6 +319,10 @@ def pairwise_shifts(
         flipud=flipud,
         fliplr=fliplr,
         rot90=rot90,
+        channel=channel,
+        timepoint=timepoint,
+        use_clahe=use_clahe,
+        clahe_clip_limit=clahe_clip_limit,
     )
 
     edge_list = []
@@ -305,11 +335,17 @@ def pairwise_shifts(
         # positions need to be not np.types to save to yaml
         pos_a_nice = list(int(x) for x in pos[0])
         pos_b_nice = list(int(x) for x in pos[1])
-        confidence_dict[key] = [
-            pos_a_nice,
-            pos_b_nice,
-            float(edge_model.model.confidence),
-        ]
+        confidence = float(edge_model.model.confidence)
+
+        if verbose:
+            conf_str = f"{confidence:.4f}"
+            if confidence < 0.3:
+                conf_str = f"{conf_str} [LOW]"
+            elif confidence < 0.5:
+                conf_str = f"{conf_str} [WARN]"
+            print(f"  Edge {key}: {pos_a_nice} <-> {pos_b_nice} confidence={conf_str}")
+
+        confidence_dict[key] = [pos_a_nice, pos_b_nice, confidence]
 
     return edge_list, confidence_dict
 
