@@ -112,19 +112,35 @@ def _get_optimal_block_size(final_shape, tile_size, default_size=(1024, 1024)):
         return default_size
 
 
-def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype_val, use_edt, tile_weights, stream=None):
+def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype_val, use_edt, tile_weights, stream=None, profile=False):
     """
     Process a single X block on GPU, optionally using a specific CUDA stream.
 
-    Returns (numer, denom, norm_cpu) tuple ready for writing.
+    Returns:
+        If profile=False: norm_cpu array
+        If profile=True:  (norm_cpu, profile_dict) where profile_dict has timing breakdown
     """
+    timings = {} if profile else None
+
     # Create buffers on the specified stream (or default)
     with xp.cuda.Stream(stream) if stream is not None else xp.cuda.Stream.null:
+        if profile:
+            xp.cuda.Device().synchronize()
+            t0 = time.time()
+
         numer = xp.zeros(
             (final_shape[0], final_shape[1], final_shape[2], y1 - y0, x1 - x0),
             dtype=dtype_val,
         )
         denom = xp.zeros_like(numer, dtype=dtype_val)
+
+        if profile:
+            xp.cuda.Device().synchronize()
+            timings['alloc'] = time.time() - t0
+            t_accum_start = time.time()
+            n_tiles_hit = 0
+            t_slice_total = 0.0
+            t_gpu_total = 0.0
 
         for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
             # X intersection within this block
@@ -134,6 +150,9 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
                 continue
             iy0 = max(y0, ys)
             iy1 = min(y1, ye)
+
+            if profile:
+                t_sl = time.time()
 
             tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
             out_sl = (
@@ -151,6 +170,11 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
                 slice(ix0 - xs, ix1 - xs),
             )
             block = tile_full[tile_sl].astype(dtype_val, copy=False)
+
+            if profile:
+                t_slice_total += time.time() - t_sl
+                t_gpu_op = time.time()
+
             if use_edt:
                 wloc = tile_weights[
                     (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
@@ -164,16 +188,78 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
                 numer[out_sl] += block
                 denom[out_sl] += (block != 0).astype(dtype_val)
 
+            if profile:
+                xp.cuda.Device().synchronize()
+                t_gpu_total += time.time() - t_gpu_op
+                n_tiles_hit += 1
+
+        if profile:
+            xp.cuda.Device().synchronize()
+            timings['accum_total'] = time.time() - t_accum_start
+            timings['accum_slice'] = t_slice_total
+            timings['accum_gpu'] = t_gpu_total
+            timings['accum_python'] = timings['accum_total'] - t_slice_total - t_gpu_total
+            timings['n_tiles_hit'] = n_tiles_hit
+            t_norm = time.time()
+
         # Normalize
         norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+
+        if profile:
+            xp.cuda.Device().synchronize()
+            timings['normalize'] = time.time() - t_norm
+            t_d2h = time.time()
 
         # Transfer to CPU for writing (synchronous on this stream)
         norm_cpu = _to_numpy(norm)
 
+        if profile:
+            timings['d2h'] = time.time() - t_d2h
+
         # Clean up
         del numer, denom, norm
 
+        if profile:
+            return norm_cpu, timings
         return norm_cpu
+
+
+def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
+    """Write a single normalized block to the output zarr array.
+
+    Called from a background thread to overlap writes with GPU processing.
+    """
+    arr_out[
+        (
+            slice(0, final_shape[0]),
+            slice(0, final_shape[1]),
+            slice(0, final_shape[2]),
+            slice(y0, y1),
+            slice(x0, x1),
+        )
+    ] = norm_cpu
+
+
+def _load_band_tiles(y_tiles, fov_store, flipud, fliplr, rot90):
+    """Load all tiles for a Y-band in parallel, returning a tile_cache dict.
+
+    Used for pipelined I/O: loading band N+1 while GPU processes band N.
+    """
+    tile_cache = {}
+
+    def _load_single(tile_meta):
+        tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
+        tile_full = fov_store[tile_name].data
+        tile_gpu = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
+        return tile_name, (tile_gpu, t_end, c_end, z_end, ys, ye, xs, xe)
+
+    with ThreadPoolExecutor(max_workers=min(16, len(y_tiles))) as loader:
+        futures = [loader.submit(_load_single, m) for m in y_tiles]
+        for future in as_completed(futures):
+            name, data = future.result()
+            tile_cache[name] = data
+
+    return tile_cache
 
 
 def _resolve_value_dtype(value_precision_bits: int):
@@ -475,6 +561,7 @@ def assemble_streaming(
     divide_tile_size: Optional[Tuple[int, int]] = (1024, 1024),
     use_adaptive_blocks: bool = True,
     parallel_x_blocks: bool = True,
+    profile: bool = False,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -484,9 +571,16 @@ def assemble_streaming(
     Args:
         use_adaptive_blocks: If True, automatically determine optimal block size based on GPU memory
         parallel_x_blocks: If True, process X blocks in parallel using CUDA streams (GPU only)
+        profile: If True, print detailed timing breakdown per Y-band (adds GPU syncs — slower but accurate)
     """
+    # Allow enabling profiling via environment variable (overrides parameter)
+    if os.environ.get("STITCH_PROFILE", "").strip() in ("1", "true", "yes"):
+        profile = True
+
     print(f"[assemble.streaming] Using blending_method: {blending_method}")
     print(f"[assemble.streaming] Adaptive blocks: {use_adaptive_blocks}, Parallel X-blocks: {parallel_x_blocks}")
+    if profile:
+        print(f"[assemble.streaming] PROFILING ENABLED (GPU syncs will slow overall runtime)")
 
     fov_store = open_ome_zarr(fov_store_path)
 
@@ -581,33 +675,36 @@ def assemble_streaming(
         ]
         y_bands.append((y0, y1, y_tiles))
 
+    # Pipeline: pre-submit tile loading for the first Y-band so I/O overlaps
+    # with GPU processing of each subsequent band
+    _pipeline_executor = ThreadPoolExecutor(max_workers=1)
+
+    # Background writer: submit zarr writes to a thread pool so GPU can
+    # continue with the next Y-band while chunks are flushed to disk.
+    # Zarr chunks are independent files — parallel writes are safe.
+    _write_executor = ThreadPoolExecutor(max_workers=14)
+    _write_futures = []
+    _next_load_future = None
+    if y_bands:
+        _next_load_future = _pipeline_executor.submit(
+            _load_band_tiles, y_bands[0][2], fov_store, flipud, fliplr, rot90
+        )
+
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
         t_band_start = time.time()
 
-        # Load all tiles for this Y-band to GPU in parallel
+        # Wait for pre-loaded tiles (pipelined: loading started during previous band's GPU processing)
         t_load_start = time.time()
-        tile_cache = {}
-
-        def load_single_tile(tile_meta):
-            """Load and augment a single tile."""
-            tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
-            tile_full = fov_store[tile_name].data
-            # Transfer to GPU immediately after loading
-            tile_gpu = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
-            return tile_name, (tile_gpu, t_end, c_end, z_end, ys, ye, xs, xe)
-
-        # Load tiles in parallel using ThreadPoolExecutor
-        # Zarr I/O releases GIL, so threads work well for parallel loading
-        # Limited to 6 workers to balance speed and GPU memory (requires 80GB+ GPU for 3 parallel wells)
-        with ThreadPoolExecutor(max_workers=min(6, len(y_tiles))) as executor:
-            futures = {executor.submit(load_single_tile, tile_meta): tile_meta[0]
-                      for tile_meta in y_tiles}
-            for future in as_completed(futures):
-                tile_name, tile_data = future.result()
-                tile_cache[tile_name] = tile_data
-
+        tile_cache = _next_load_future.result()
         t_load_elapsed = time.time() - t_load_start
-        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles in parallel: {t_load_elapsed:.2f}s")
+
+        # Submit loading for next Y-band (overlaps with GPU processing below)
+        if band_idx + 1 < len(y_bands):
+            _next_load_future = _pipeline_executor.submit(
+                _load_band_tiles, y_bands[band_idx + 1][2], fov_store, flipud, fliplr, rot90
+            )
+
+        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles (waited {t_load_elapsed:.2f}s)")
 
         # Optionally synchronize GPU before processing if using CuPy
         if _USING_CUPY:
@@ -624,9 +721,14 @@ def assemble_streaming(
         if parallel_x_blocks and _USING_CUPY and len(x_blocks) > 1:
             print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks in parallel...")
 
-            # Create streams for parallel processing (limit to 4 concurrent streams)
-            num_streams = min(4, len(x_blocks))
+            # Create streams for parallel processing (up to 14 to cover all X-blocks in one launch)
+            num_streams = min(14, len(x_blocks))
             streams = [xp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
+
+            # Profile first X-block of first band in detail; accumulate summary for the rest
+            _profile_this_band = profile and (band_idx == 0)
+            _band_prof = {'compute': 0.0, 'zarr_submit': 0.0, 'sync': 0.0}
+            _block_profiles = []
 
             # Process blocks in batches
             for batch_start in range(0, len(x_blocks), num_streams):
@@ -637,35 +739,59 @@ def assemble_streaming(
                 results = []
                 for idx, (x0, x1) in enumerate(batch_blocks):
                     stream = streams[idx % num_streams]
-                    norm_cpu = _process_x_block_gpu(
+                    t_comp = time.time()
+                    ret = _process_x_block_gpu(
                         x0, x1, y0, y1, y_tiles, tile_cache, final_shape,
-                        dtype_val, use_edt, tile_weights, stream
+                        dtype_val, use_edt, tile_weights, stream,
+                        profile=_profile_this_band,
                     )
+                    if _profile_this_band:
+                        norm_cpu, bp = ret
+                        _block_profiles.append(bp)
+                    else:
+                        norm_cpu = ret
+                    _band_prof['compute'] += time.time() - t_comp
                     results.append((x0, x1, norm_cpu))
 
                 # Synchronize streams before writing
+                t_sync = time.time()
                 for stream in streams[:len(batch_blocks)]:
                     stream.synchronize()
+                _band_prof['sync'] += time.time() - t_sync
 
-                # Write results sequentially (I/O is sequential anyway)
+                # Submit writes to background thread pool (non-blocking)
+                t_write = time.time()
                 for x0, x1, norm_cpu in results:
-                    arr_out[
-                        (
-                            slice(0, final_shape[0]),
-                            slice(0, final_shape[1]),
-                            slice(0, final_shape[2]),
-                            slice(y0, y1),
-                            slice(x0, x1),
-                        )
-                    ] = norm_cpu
-                    del norm_cpu
-
-                # Free GPU memory after batch
-                if _USING_CUPY:
-                    xp.get_default_memory_pool().free_all_blocks()
+                    fut = _write_executor.submit(
+                        _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, norm_cpu
+                    )
+                    _write_futures.append(fut)
+                _band_prof['zarr_submit'] += time.time() - t_write
 
             t_process_elapsed = time.time() - t_process_start
-            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s")
+
+            if profile:
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] PROFILE: "
+                      f"compute={_band_prof['compute']:.2f}s  "
+                      f"sync={_band_prof['sync']:.2f}s  "
+                      f"zarr_submit={_band_prof['zarr_submit']:.2f}s  "
+                      f"total={t_process_elapsed:.2f}s")
+                if _block_profiles:
+                    # Detailed breakdown of first band's X-blocks
+                    avg_p = {k: sum(b.get(k, 0) for b in _block_profiles) / len(_block_profiles)
+                             for k in ['alloc', 'accum_total', 'accum_slice', 'accum_gpu',
+                                        'accum_python', 'normalize', 'd2h']}
+                    avg_tiles = sum(b.get('n_tiles_hit', 0) for b in _block_profiles) / len(_block_profiles)
+                    print(f"    [Per X-block avg, {len(_block_profiles)} blocks, {avg_tiles:.0f} tiles/block]")
+                    print(f"      alloc={avg_p['alloc']*1000:.1f}ms  "
+                          f"accum={avg_p['accum_total']*1000:.1f}ms "
+                          f"(slice={avg_p['accum_slice']*1000:.1f}ms "
+                          f"gpu={avg_p['accum_gpu']*1000:.1f}ms "
+                          f"python={avg_p['accum_python']*1000:.1f}ms)  "
+                          f"norm={avg_p['normalize']*1000:.1f}ms  "
+                          f"d2h={avg_p['d2h']*1000:.1f}ms")
+            else:
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s")
 
         else:
             # Sequential processing (fallback or CPU)
@@ -737,12 +863,34 @@ def assemble_streaming(
             print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing: {t_process_elapsed:.2f}s")
 
         # Free cache for this Y band
+        t_cleanup = time.time()
         tile_cache.clear()
         if _USING_CUPY:
             xp.get_default_memory_pool().free_all_blocks()
+        t_cleanup_elapsed = time.time() - t_cleanup
 
         t_band_elapsed = time.time() - t_band_start
-        print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
+        if profile:
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] cleanup={t_cleanup_elapsed:.2f}s  "
+                  f"band_total={t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
+        else:
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
+
+    _pipeline_executor.shutdown(wait=False)
+
+    # Drain all background zarr writes and shut down the write executor
+    t_drain_start = time.time()
+    n_failed = 0
+    for fut in _write_futures:
+        try:
+            fut.result()
+        except Exception as e:
+            n_failed += 1
+            print(f"  WARNING: background zarr write failed: {e}")
+    _write_executor.shutdown(wait=True)
+    t_drain_elapsed = time.time() - t_drain_start
+    print(f"  [Write drain] Waited {t_drain_elapsed:.2f}s for {len(_write_futures)} background writes"
+          f"{f' ({n_failed} failed)' if n_failed else ''}")
 
     return stitched_pos["0"]
 
@@ -777,6 +925,7 @@ def _process_single_well(well_id, shifts, output_store, input_store_path, tile_s
             chunks_size=chunks_size,
             scale=scale,
             divide_tile_size=kwargs.get("target_chunks_yx", (1024, 1024)),
+            profile=kwargs.get("profile", False),
         )
 
         del stitched_pos  # free reference
