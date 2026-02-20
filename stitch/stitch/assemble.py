@@ -443,7 +443,9 @@ def assemble(
 
                 _mask = _np.zeros((ty, tx), dtype=bool)
                 _mask[1:-1, 1:-1] = True
-                _dist = cundi.distance_transform_edt(_mask).astype(_np.float32)
+                _mask_xp = xp.asarray(_mask)
+                _dist = cundi.distance_transform_edt(_mask_xp)
+                _dist = _np.asarray(_to_numpy(_dist), dtype=_np.float32)
                 _dist += 1e-6
                 _weights = _np.power(_dist, float(blending_exponent), where=(_dist > 0))
                 tile_weights = xp.asarray(_weights, dtype=dtype_val)
@@ -638,7 +640,9 @@ def assemble_streaming(
         _mask = _np.zeros((ty, tx), dtype=bool)
         if ty > 2 and tx > 2:
             _mask[1:-1, 1:-1] = True
-        _dist = cundi.distance_transform_edt(_mask).astype(_np.float32)
+        _mask_xp = xp.asarray(_mask)
+        _dist = cundi.distance_transform_edt(_mask_xp)
+        _dist = _np.asarray(_to_numpy(_dist), dtype=_np.float32)
         _dist += 1e-6
         _weights = _np.power(_dist, float(blending_exponent), where=(_dist > 0))
         tile_weights = xp.asarray(_weights, dtype=dtype_val)
