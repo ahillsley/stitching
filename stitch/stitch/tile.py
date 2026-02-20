@@ -91,13 +91,14 @@ class TileCache:
     - get_item
     """
 
-    def __init__(self, store_path, well, flipud, fliplr, rot90):
+    def __init__(self, store_path, well, flipud, fliplr, rot90, timepoint=0):
         self.cache = LimitedSizeDict(max_size=20)
         self.store = open_ome_zarr(store_path)
         self.well = well
         self.flipud = flipud
         self.fliplr = fliplr
         self.rot90 = rot90
+        self.timepoint = timepoint
 
     def add(self, obj):
         """add an object to the cache"""
@@ -124,8 +125,8 @@ class TileCache:
 
         aug_tile = augment_tile(
             da_tile[
-                0, 0, 0, :, :
-            ].compute(),  # TODO: hardcoded to 2D # TODO: changed to 100!
+                self.timepoint, 0, 0, :, :
+            ].compute(),
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
@@ -507,6 +508,7 @@ def pairwise_shifts(
     rot90: bool,
     overlap: int = 150,
     max_workers: int = 16,
+    timepoint: int = 0,
 ) -> List:
     """ """
     # get neighboring tiles
@@ -520,6 +522,7 @@ def pairwise_shifts(
         flipud=flipud,
         fliplr=fliplr,
         rot90=rot90,
+        timepoint=timepoint,
     )
 
     edge_list = []

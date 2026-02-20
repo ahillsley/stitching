@@ -1050,6 +1050,7 @@ def estimate_stitch(
     overlap: int = 150,
     x_guess: Optional[dict] = None,
     limit_positions: Optional[int] = None,
+    timepoint_per_well: Optional[dict] = None,
 ):
     """Mimic of Biahub estimate stitch function"""
 
@@ -1125,6 +1126,11 @@ def estimate_stitch(
         well_positions = grouped_positions[well_id]
         tile_lut = {t[4:]: i for i, t in enumerate(well_positions)}
 
+        # Look up per-well timepoint override (default to 0)
+        timepoint = 0
+        if timepoint_per_well is not None:
+            timepoint = timepoint_per_well.get(well_id, 0)
+
         edge_list, confidence_dict = pairwise_shifts(
             well_positions,
             input_store_path,
@@ -1133,6 +1139,7 @@ def estimate_stitch(
             fliplr=fliplr,
             rot90=rot90,
             overlap=overlap,
+            timepoint=timepoint,
         )
 
         opt_shift_dict = optimal_positions(edge_list, tile_lut, well_id, tile_size, x_guess)
