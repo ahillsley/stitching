@@ -279,16 +279,14 @@ def offset(
     if roi_b_min < 0:
         roi_b = roi_b - roi_b_min
 
-    # Use GPU-accelerated registration
+    # Always use dexp for registration (accurate subpixel shifts + confidence).
+    # The ROIs are small (overlap-sized crops) so CPU is fast enough.
+    # GPU register_translation_gpu has inaccurate confidence scores and no subpixel refinement.
     if _USING_CUPY:
-        shift_vector, confidence = register_translation_gpu(roi_a, roi_b)
-        # Create model with required arguments
-        adjusted_shift = shift_vector + np.array([corr_y, corr_x])
-        model = TranslationRegistrationModel(shift_vector=adjusted_shift, confidence=confidence)
-    else:
-        # CPU fallback
-        model = dexp_reg.register_translation_nd(roi_a, roi_b)
-        model.shift_vector += np.array([corr_y, corr_x])
+        roi_a = xp.asnumpy(roi_a)
+        roi_b = xp.asnumpy(roi_b)
+    model = dexp_reg.register_translation_nd(roi_a, roi_b)
+    model.shift_vector += np.array([corr_y, corr_x])
 
     return model
 
