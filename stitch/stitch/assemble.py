@@ -194,13 +194,11 @@ def assemble(
         if tile_weights is None:
             # Boolean mask with interior True, edges False
             if ty > 2 and tx > 2:
-                import numpy as _np
-
-                _mask = _np.zeros((ty, tx), dtype=bool)
+                _mask = xp.zeros((ty, tx), dtype=bool)
                 _mask[1:-1, 1:-1] = True
-                _dist = cundi.distance_transform_edt(_mask).astype(_np.float32)
+                _dist = cundi.distance_transform_edt(_mask).astype(xp.float32)
                 _dist += 1e-6
-                _weights = _np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                _weights = xp.where(_dist > 0, _dist ** float(blending_exponent), 0.0)
                 tile_weights = xp.asarray(_weights, dtype=dtype_val)
             else:
                 tile_weights = xp.ones((ty, tx), dtype=dtype_val)
@@ -388,14 +386,12 @@ def assemble_streaming(
     # Precompute EDT weights for one tile
     if use_edt:
         ty, tx = int(tile_size[0]), int(tile_size[1])
-        import numpy as _np
-
-        _mask = _np.zeros((ty, tx), dtype=bool)
+        _mask = xp.zeros((ty, tx), dtype=bool)
         if ty > 2 and tx > 2:
             _mask[1:-1, 1:-1] = True
-        _dist = cundi.distance_transform_edt(_mask).astype(_np.float32)
+        _dist = cundi.distance_transform_edt(_mask).astype(xp.float32)
         _dist += 1e-6
-        _weights = _np.power(_dist, float(blending_exponent), where=(_dist > 0))
+        _weights = xp.where(_dist > 0, _dist ** float(blending_exponent), 0.0)
         tile_weights = xp.asarray(_weights, dtype=dtype_val)
     else:
         tile_weights = None
@@ -512,9 +508,9 @@ def assemble_streaming(
                         if int(xp.count_nonzero(nz2d)) == nz2d.size:
                             wloc2d = tile_weights[iy0 - ys_c : iy1 - ys_c, ix0 - xs_c : ix1 - xs_c]
                         else:
-                            _dist = cundi.distance_transform_edt(nz2d).astype(np.float32)
+                            _dist = cundi.distance_transform_edt(nz2d).astype(xp.float32)
                             _dist += 1e-6
-                            wloc2d = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                            wloc2d = xp.where(_dist > 0, _dist ** float(blending_exponent), 0.0)
                             wloc2d = xp.asarray(wloc2d, dtype=dtype_val)
 
                         wloc5 = wloc2d[None, None, None, :, :]
@@ -719,9 +715,9 @@ def assemble_streaming(
                                     wloc2d = tile_weights[iy0 - ys : iy1 - ys, ix0 - xs : ix1 - xs]
                                 else:
                                     # Compute EDT on actual nonzero mask (data-driven)
-                                    _dist = cundi.distance_transform_edt(nz2d).astype(np.float32)
+                                    _dist = cundi.distance_transform_edt(nz2d).astype(xp.float32)
                                     _dist += 1e-6
-                                    wloc2d = np.power(_dist, float(blending_exponent), where=(_dist > 0))
+                                    wloc2d = xp.where(_dist > 0, _dist ** float(blending_exponent), 0.0)
                                     wloc2d = xp.asarray(wloc2d, dtype=dtype_val)
 
                                 # Expand to (T, 1, Z, Y, X) by broadcasting
@@ -1041,6 +1037,18 @@ def estimate_stitch(
         clahe_clip_limit: CLAHE contrast limit (default: 0.02)
         verbose: Print confidence scores as edges are computed (default: False)
     """
+
+    if verbose:
+        print(f"[assemble.estimate_stitch] Configuration:")
+        print(f"  input_store_path  = {input_store_path}")
+        print(f"  output_config_path = {output_config_path}")
+        print(f"  flipud={flipud}, fliplr={fliplr}, rot90={rot90}")
+        print(f"  tile_size={tile_size}, overlap={overlap}")
+        print(f"  channel={channel}, timepoint={timepoint}")
+        print(f"  timepoint_per_well={timepoint_per_well}")
+        print(f"  use_clahe={use_clahe}, clahe_clip_limit={clahe_clip_limit}")
+        print(f"  limit_positions={limit_positions}")
+        print(f"  x_guess={x_guess}")
 
     store = open_ome_zarr(input_store_path)
     if limit_positions is not None and int(limit_positions) > 0:
