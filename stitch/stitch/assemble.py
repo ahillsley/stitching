@@ -6,7 +6,7 @@ import dask.array as da
 from tqdm import tqdm
 from stitch.stitch.tile import augment_tile, pairwise_shifts, optimal_positions
 from stitch.connect import read_shifts_biahub
-from collections import defaultdict
+from collections import defaultdict, deque
 from iohub.ngff import TransformationMeta
 from typing import Any, Callable, Dict, Literal, Optional, Tuple, Type, Union
 import itertools
@@ -222,6 +222,137 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
         if profile:
             return norm_cpu, timings
         return norm_cpu
+
+
+def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
+                        dtype_val, use_edt, tile_weights, profile=False,
+                        return_gpu=False):
+    """Process entire Y-band as a single GPU operation.
+
+    Instead of 52 separate X-block operations with individual alloc/normalize/D2H
+    cycles, allocates one buffer spanning the full band width and processes all
+    tiles in a single pass.
+
+    If return_gpu=True, returns the GPU array without D2H transfer (caller handles it).
+    """
+    timings = {} if profile else None
+
+    if profile:
+        xp.cuda.Device().synchronize()
+        t0 = time.time()
+
+    band_height = y1 - y0
+    numer = xp.zeros(
+        (final_shape[0], final_shape[1], final_shape[2], band_height, total_x),
+        dtype=dtype_val,
+    )
+    denom = xp.zeros_like(numer, dtype=dtype_val)
+
+    if profile:
+        xp.cuda.Device().synchronize()
+        timings['alloc'] = time.time() - t0
+        t_accum_start = time.time()
+        n_tiles_hit = 0
+
+    for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
+        iy0 = max(y0, ys)
+        iy1 = min(y1, ye)
+        ix0 = max(0, xs)
+        ix1 = min(total_x, xe)
+        if ix0 >= ix1 or iy0 >= iy1:
+            continue
+
+        tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+        out_sl = (
+            slice(0, t_end),
+            slice(0, c_end),
+            slice(0, z_end),
+            slice(iy0 - y0, iy1 - y0),
+            slice(ix0, ix1),
+        )
+        tile_sl = (
+            slice(0, t_end),
+            slice(0, c_end),
+            slice(0, z_end),
+            slice(iy0 - ys, iy1 - ys),
+            slice(ix0 - xs, ix1 - xs),
+        )
+        block = tile_full[tile_sl].astype(dtype_val, copy=False)
+
+        if use_edt:
+            wloc = tile_weights[
+                (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
+            ]
+            wloc = xp.asarray(wloc, dtype=dtype_val)
+            nz = block != 0
+            wloc = wloc * nz
+            numer[out_sl] += block * wloc
+            denom[out_sl] += wloc
+        else:
+            numer[out_sl] += block
+            denom[out_sl] += (block != 0).astype(dtype_val)
+
+        if profile:
+            n_tiles_hit += 1
+
+    if profile:
+        xp.cuda.Device().synchronize()
+        timings['accum'] = time.time() - t_accum_start
+        timings['n_tiles_hit'] = n_tiles_hit
+        t_norm = time.time()
+
+    # Normalize
+    norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+
+    if profile:
+        xp.cuda.Device().synchronize()
+        timings['normalize'] = time.time() - t_norm
+
+    # Free intermediates (keep norm)
+    del numer, denom
+
+    if return_gpu:
+        # Return GPU array — caller handles D2H (for pipelined transfer)
+        if profile:
+            return norm, timings
+        return norm
+
+    if profile:
+        t_d2h = time.time()
+
+    # Transfer entire band to CPU
+    norm_cpu = _to_numpy(norm)
+
+    if profile:
+        timings['d2h'] = time.time() - t_d2h
+
+    del norm
+
+    if profile:
+        return norm_cpu, timings
+    return norm_cpu
+
+
+def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
+                           y0, y1, tx, total_x, _write_executor, _write_futures):
+    """Transfer GPU result to CPU on a dedicated stream, then submit zarr writes.
+
+    Runs in a background thread so the main thread can start the next band's
+    GPU compute while this D2H transfer is in progress.  The transfer_stream
+    ensures the DMA engine handles the copy independently of the compute stream.
+    """
+    with transfer_stream:
+        norm_cpu = norm_gpu.get()  # syncs transfer_stream only, then DMA copy
+    del norm_gpu
+
+    # Split into X-block chunks for zarr chunk alignment
+    for x0 in range(0, total_x, tx):
+        x1 = min(total_x, x0 + tx)
+        block_cpu = norm_cpu[:, :, :, :, x0:x1]
+        fut = _write_executor.submit(
+            _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, block_cpu
+        )
+        _write_futures.append(fut)
 
 
 def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
@@ -679,123 +810,85 @@ def assemble_streaming(
         ]
         y_bands.append((y0, y1, y_tiles))
 
-    # Pipeline: pre-submit tile loading for the first Y-band so I/O overlaps
-    # with GPU processing of each subsequent band
-    _pipeline_executor = ThreadPoolExecutor(max_workers=1)
+    # Pipeline: prefetch multiple Y-bands ahead so tiles are ready when GPU needs them.
+    # With 2 concurrent loaders and 3-band prefetch, effective loading rate (~3.5s/band)
+    # roughly matches GPU processing rate (~2-3s/band), eliminating most tile-wait stalls.
+    _pipeline_executor = ThreadPoolExecutor(max_workers=2)
+    _prefetch_depth = 3
 
     # Background writer: submit zarr writes to a thread pool so GPU can
     # continue with the next Y-band while chunks are flushed to disk.
     # Zarr chunks are independent files — parallel writes are safe.
     _write_executor = ThreadPoolExecutor(max_workers=14)
     _write_futures = []
-    _next_load_future = None
-    if y_bands:
-        _next_load_future = _pipeline_executor.submit(
-            _load_band_tiles, y_bands[0][2], fov_store, flipud, fliplr, rot90
-        )
+
+    # D2H pipelining: transfer GPU results to CPU on a dedicated CUDA stream
+    # in a background thread, so GPU can start the next band's compute immediately.
+    _d2h_executor = ThreadPoolExecutor(max_workers=1)
+    _transfer_stream = xp.cuda.Stream(non_blocking=True) if _USING_CUPY else None
+    _prev_d2h_future = None
+
+    _load_futures = deque()
+    for i in range(min(_prefetch_depth, len(y_bands))):
+        _load_futures.append(_pipeline_executor.submit(
+            _load_band_tiles, y_bands[i][2], fov_store, flipud, fliplr, rot90
+        ))
 
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
         t_band_start = time.time()
 
-        # Wait for pre-loaded tiles (pipelined: loading started during previous band's GPU processing)
+        # Wait for pre-loaded tiles (pipelined: loaded during previous bands' processing)
         t_load_start = time.time()
-        tile_cache = _next_load_future.result()
+        tile_cache = _load_futures.popleft().result()
         t_load_elapsed = time.time() - t_load_start
 
-        # Submit loading for next Y-band (overlaps with GPU processing below)
-        if band_idx + 1 < len(y_bands):
-            _next_load_future = _pipeline_executor.submit(
-                _load_band_tiles, y_bands[band_idx + 1][2], fov_store, flipud, fliplr, rot90
-            )
+        # Keep prefetch pipeline full
+        next_prefetch = band_idx + _prefetch_depth
+        if next_prefetch < len(y_bands):
+            _load_futures.append(_pipeline_executor.submit(
+                _load_band_tiles, y_bands[next_prefetch][2], fov_store, flipud, fliplr, rot90
+            ))
 
         print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles (waited {t_load_elapsed:.2f}s)")
 
-        # Optionally synchronize GPU before processing if using CuPy
-        if _USING_CUPY:
-            xp.cuda.Stream.null.synchronize()
+        # X-block list for zarr chunk alignment (used by both GPU and CPU paths)
+        x_blocks = [(x0, min(total_x, x0 + tx)) for x0 in range(0, total_x, tx)]
 
-        # Process all X blocks for this Y band
-        x_blocks = []
-        for x0 in range(0, total_x, tx):
-            x1 = min(total_x, x0 + tx)
-            x_blocks.append((x0, x1))
-
-        # Parallel X-block processing using CUDA streams (GPU only)
+        # Full Y-band GPU processing with pipelined D2H
         t_process_start = time.time()
-        if parallel_x_blocks and _USING_CUPY and len(x_blocks) > 1:
-            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing {len(x_blocks)} X-blocks in parallel...")
-
-            # Create streams for parallel processing (up to 14 to cover all X-blocks in one launch)
-            num_streams = min(14, len(x_blocks))
-            streams = [xp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
-
-            # Profile first X-block of first band in detail; accumulate summary for the rest
-            _profile_this_band = profile and (band_idx == 0)
-            _band_prof = {'compute': 0.0, 'zarr_submit': 0.0, 'sync': 0.0}
-            _block_profiles = []
-
-            # Process blocks in batches
-            for batch_start in range(0, len(x_blocks), num_streams):
-                batch_end = min(batch_start + num_streams, len(x_blocks))
-                batch_blocks = x_blocks[batch_start:batch_end]
-
-                # Launch processing on streams
-                results = []
-                for idx, (x0, x1) in enumerate(batch_blocks):
-                    stream = streams[idx % num_streams]
-                    t_comp = time.time()
-                    ret = _process_x_block_gpu(
-                        x0, x1, y0, y1, y_tiles, tile_cache, final_shape,
-                        dtype_val, use_edt, tile_weights, stream,
-                        profile=_profile_this_band,
-                    )
-                    if _profile_this_band:
-                        norm_cpu, bp = ret
-                        _block_profiles.append(bp)
-                    else:
-                        norm_cpu = ret
-                    _band_prof['compute'] += time.time() - t_comp
-                    results.append((x0, x1, norm_cpu))
-
-                # Synchronize streams before writing
-                t_sync = time.time()
-                for stream in streams[:len(batch_blocks)]:
-                    stream.synchronize()
-                _band_prof['sync'] += time.time() - t_sync
-
-                # Submit writes to background thread pool (non-blocking)
-                t_write = time.time()
-                for x0, x1, norm_cpu in results:
-                    fut = _write_executor.submit(
-                        _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, norm_cpu
-                    )
-                    _write_futures.append(fut)
-                _band_prof['zarr_submit'] += time.time() - t_write
+        if _USING_CUPY:
+            ret = _process_y_band_gpu(
+                y0, y1, total_x, y_tiles, tile_cache, final_shape,
+                dtype_val, use_edt, tile_weights, profile=profile,
+                return_gpu=True,
+            )
+            if profile:
+                norm_gpu, band_timings = ret
+            else:
+                norm_gpu = ret
 
             t_process_elapsed = time.time() - t_process_start
 
+            # Wait for previous band's D2H + writes to complete before submitting new one
+            if _prev_d2h_future is not None:
+                _prev_d2h_future.result()
+
+            # Submit D2H + write for current band in background thread.
+            # GPU is free to process next band while DMA engine handles the transfer.
+            _prev_d2h_future = _d2h_executor.submit(
+                _d2h_and_submit_writes, norm_gpu, _transfer_stream,
+                arr_out, final_shape, y0, y1, tx, total_x,
+                _write_executor, _write_futures,
+            )
+
             if profile:
                 print(f"  [Y-band {band_idx+1}/{len(y_bands)}] PROFILE: "
-                      f"compute={_band_prof['compute']:.2f}s  "
-                      f"sync={_band_prof['sync']:.2f}s  "
-                      f"zarr_submit={_band_prof['zarr_submit']:.2f}s  "
-                      f"total={t_process_elapsed:.2f}s")
-                if _block_profiles:
-                    # Detailed breakdown of first band's X-blocks
-                    avg_p = {k: sum(b.get(k, 0) for b in _block_profiles) / len(_block_profiles)
-                             for k in ['alloc', 'accum_total', 'accum_slice', 'accum_gpu',
-                                        'accum_python', 'normalize', 'd2h']}
-                    avg_tiles = sum(b.get('n_tiles_hit', 0) for b in _block_profiles) / len(_block_profiles)
-                    print(f"    [Per X-block avg, {len(_block_profiles)} blocks, {avg_tiles:.0f} tiles/block]")
-                    print(f"      alloc={avg_p['alloc']*1000:.1f}ms  "
-                          f"accum={avg_p['accum_total']*1000:.1f}ms "
-                          f"(slice={avg_p['accum_slice']*1000:.1f}ms "
-                          f"gpu={avg_p['accum_gpu']*1000:.1f}ms "
-                          f"python={avg_p['accum_python']*1000:.1f}ms)  "
-                          f"norm={avg_p['normalize']*1000:.1f}ms  "
-                          f"d2h={avg_p['d2h']*1000:.1f}ms")
+                      f"alloc={band_timings['alloc']*1000:.1f}ms  "
+                      f"accum={band_timings['accum']*1000:.1f}ms ({band_timings['n_tiles_hit']} tiles)  "
+                      f"norm={band_timings['normalize']*1000:.1f}ms  "
+                      f"total={t_process_elapsed:.2f}s (D2H pipelined)")
             else:
-                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s")
+                print(f"  [Y-band {band_idx+1}/{len(y_bands)}] GPU processing: {t_process_elapsed:.2f}s (D2H pipelined)")
 
         else:
             # Sequential processing (fallback or CPU)
@@ -858,10 +951,8 @@ def assemble_streaming(
                     )
                 ] = norm_cpu
 
-                # Free GPU memory immediately after writing
+                # Free GPU arrays (memory pool will reuse blocks)
                 del numer, denom, norm, norm_cpu
-                if _USING_CUPY:
-                    xp.get_default_memory_pool().free_all_blocks()
 
             t_process_elapsed = time.time() - t_process_start
             print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing: {t_process_elapsed:.2f}s")
@@ -869,8 +960,6 @@ def assemble_streaming(
         # Free cache for this Y band
         t_cleanup = time.time()
         tile_cache.clear()
-        if _USING_CUPY:
-            xp.get_default_memory_pool().free_all_blocks()
         t_cleanup_elapsed = time.time() - t_cleanup
 
         t_band_elapsed = time.time() - t_band_start
@@ -881,6 +970,11 @@ def assemble_streaming(
             print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
 
     _pipeline_executor.shutdown(wait=False)
+
+    # Wait for last band's D2H + write submission to complete
+    if _prev_d2h_future is not None:
+        _prev_d2h_future.result()
+    _d2h_executor.shutdown(wait=True)
 
     # Drain all background zarr writes and shut down the write executor
     t_drain_start = time.time()
