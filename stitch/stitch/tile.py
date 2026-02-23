@@ -1,13 +1,20 @@
+from __future__ import annotations
+
 import numpy as np
 from stitch import connect
 from collections import OrderedDict
 from iohub import open_ome_zarr
 import dask.array as da
-from typing import List, Dict
+from typing import List, Dict, TYPE_CHECKING
 from tqdm import tqdm
 import scipy
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+if TYPE_CHECKING:
+    from dexp.processing.registration.model.translation_registration_model import (
+        TranslationRegistrationModel,
+    )
 
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
@@ -91,13 +98,16 @@ class TileCache:
     - get_item
     """
 
-    def __init__(self, store_path, well, flipud, fliplr, rot90, timepoint=0):
+    def __init__(self, store_path, well, flipud, fliplr, rot90, channel=0, timepoint=0, use_clahe=False, clahe_clip_limit=0.02):
         self.cache = LimitedSizeDict(max_size=20)
         self.store = open_ome_zarr(store_path)
         self.well = well
         self.flipud = flipud
         self.fliplr = fliplr
         self.rot90 = rot90
+        self.channel = channel
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
         self.timepoint = timepoint
 
     def add(self, obj):
@@ -123,10 +133,20 @@ class TileCache:
         """load a tile and add it to the cache"""
         da_tile = da.from_array(self.store[f"{self.well}/{key}"].data)
 
+        tile = da_tile[self.timepoint, self.channel, 0, :, :].compute()  # T=timepoint, C=channel, Z=0
+
+        # Apply CLAHE preprocessing if enabled
+        if self.use_clahe:
+            from skimage.exposure import equalize_adapthist
+            # Normalize to [0, 1] for CLAHE
+            tile_min, tile_max = np.percentile(tile, [1, 99])
+            tile_norm = np.clip((tile.astype(np.float32) - tile_min) / (tile_max - tile_min + 1e-8), 0, 1)
+            # Apply CLAHE with default kernel size (1/8 of image size)
+            tile = equalize_adapthist(tile_norm, clip_limit=self.clahe_clip_limit)
+            # Keep as float [0, 1]
+
         aug_tile = augment_tile(
-            da_tile[
-                self.timepoint, 0, 0, :, :
-            ].compute(),
+            tile,
             flipud=self.flipud,
             fliplr=self.fliplr,
             rot90=self.rot90,
@@ -260,16 +280,14 @@ def offset(
     if roi_b_min < 0:
         roi_b = roi_b - roi_b_min
 
-    # Use GPU-accelerated registration
+    # Always use dexp for registration (accurate subpixel shifts + confidence).
+    # The ROIs are small (overlap-sized crops) so CPU is fast enough.
+    # GPU register_translation_gpu has inaccurate confidence scores and no subpixel refinement.
     if _USING_CUPY:
-        shift_vector, confidence = register_translation_gpu(roi_a, roi_b)
-        # Create model with required arguments
-        adjusted_shift = shift_vector + np.array([corr_y, corr_x])
-        model = TranslationRegistrationModel(shift_vector=adjusted_shift, confidence=confidence)
-    else:
-        # CPU fallback
-        model = dexp_reg.register_translation_nd(roi_a, roi_b)
-        model.shift_vector += np.array([corr_y, corr_x])
+        roi_a = xp.asnumpy(roi_a)
+        roi_b = xp.asnumpy(roi_b)
+    model = dexp_reg.register_translation_nd(roi_a, roi_b)
+    model.shift_vector += np.array([corr_y, corr_x])
 
     return model
 
@@ -508,7 +526,11 @@ def pairwise_shifts(
     rot90: bool,
     overlap: int = 150,
     max_workers: int = 16,
+    channel: int = 0,
     timepoint: int = 0,
+    use_clahe: bool = False,
+    clahe_clip_limit: float = 0.02,
+    verbose: bool = False,
 ) -> List:
     """ """
     # get neighboring tiles
@@ -522,7 +544,10 @@ def pairwise_shifts(
         flipud=flipud,
         fliplr=fliplr,
         rot90=rot90,
+        channel=channel,
         timepoint=timepoint,
+        use_clahe=use_clahe,
+        clahe_clip_limit=clahe_clip_limit,
     )
 
     edge_list = []
@@ -543,6 +568,16 @@ def pairwise_shifts(
         for future in tqdm(as_completed(futures), total=num_edges, desc="Computing edge shifts"):
             key, edge_model, confidence_entry = future.result()
             edge_list.append(edge_model)
+
+            if verbose:
+                confidence = confidence_entry[2]
+                conf_str = f"{confidence:.4f}"
+                if confidence < 0.3:
+                    conf_str = f"{conf_str} [LOW]"
+                elif confidence < 0.5:
+                    conf_str = f"{conf_str} [WARN]"
+                print(f"  Edge {key}: {confidence_entry[0]} <-> {confidence_entry[1]} confidence={conf_str}")
+
             confidence_dict[key] = confidence_entry
 
     return edge_list, confidence_dict

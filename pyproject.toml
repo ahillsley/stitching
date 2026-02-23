@@ -10,9 +10,22 @@ description = "stitching of multi-fov microscopy datasets"
 authors = [
     { name = "Alex Hillsley", email = "alexander.hillsley@czbiohub.org" },
 ]
-#TODO: add dependencies
 dependencies = [
-    
+    "numpy",
+    "scipy",
+    "dask[array]",
+    "zarr",
+    "tqdm",
+    "pyyaml",
+    "iohub",
+    "scikit-image",  # for CLAHE preprocessing
+    "dexp",  # for registration
+    "joblib",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x",  # for GPU acceleration (adjust cuda version as needed)
 ]
 
 # Hatch config
