@@ -1,6 +1,7 @@
 from iohub.ngff import open_ome_zarr
 import os
 import math
+import json
 import zarr
 import dask.array as da
 from tqdm import tqdm
@@ -95,7 +96,8 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
                 slice(iy0 - ys, iy1 - ys),
                 slice(ix0 - xs, ix1 - xs),
             )
-            block = tile_full[tile_sl].astype(dtype_val, copy=False)
+            # Slice on CPU first (cheap numpy indexing), then transfer to GPU
+            block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
 
             if profile:
                 t_slice_total += time.time() - t_sl
@@ -160,6 +162,9 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
     tiles in a single pass.
 
     If return_gpu=True, returns the GPU array without D2H transfer (caller handles it).
+
+    Caller should wrap this in a per-well CUDA stream context to avoid
+    default-stream serialization across wells.
     """
     timings = {} if profile else None
 
@@ -203,7 +208,8 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
             slice(iy0 - ys, iy1 - ys),
             slice(ix0 - xs, ix1 - xs),
         )
-        block = tile_full[tile_sl].astype(dtype_val, copy=False)
+        # Slice on CPU first (cheap numpy indexing), then transfer to GPU
+        block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
 
         if use_edt:
             wloc = tile_weights[
@@ -270,6 +276,8 @@ def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
     with transfer_stream:
         norm_cpu = norm_gpu.get()  # syncs transfer_stream only, then DMA copy
     del norm_gpu
+    # Release GPU memory immediately so other parallel wells can use it
+    xp.get_default_memory_pool().free_all_blocks()
 
     # Split into X-block chunks for zarr chunk alignment
     for x0 in range(0, total_x, tx):
@@ -297,18 +305,21 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
     ] = norm_cpu
 
 
-def _load_band_tiles(y_tiles, fov_store, flipud, fliplr, rot90):
+def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90):
     """Load all tiles for a Y-band in parallel, returning a tile_cache dict.
 
+    Uses direct zarr array access (bypasses iohub HCS metadata parsing).
     Used for pipelined I/O: loading band N+1 while GPU processes band N.
     """
     tile_cache = {}
 
     def _load_single(tile_meta):
         tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
-        tile_full = fov_store[tile_name].data
-        tile_gpu = augment_tile(xp.asarray(tile_full), flipud, fliplr, rot90)
-        return tile_name, (tile_gpu, t_end, c_end, z_end, ys, ye, xs, xe)
+        tile_full = zarr.open(str(store_path / tile_name / "0"), mode="r")
+        # Keep tiles on CPU to avoid GPU memory contention between parallel wells.
+        # Tiles are transferred to GPU per-slice during band processing.
+        tile_cpu = augment_tile(np.asarray(tile_full), flipud, fliplr, rot90)
+        return tile_name, (tile_cpu, t_end, c_end, z_end, ys, ye, xs, xe)
 
     with ThreadPoolExecutor(max_workers=min(16, len(y_tiles))) as loader:
         futures = [loader.submit(_load_single, m) for m in y_tiles]
@@ -562,10 +573,16 @@ def assemble_streaming(
     if profile:
         print(f"[assemble.streaming] PROFILING ENABLED (GPU syncs will slow overall runtime)")
 
-    fov_store = open_ome_zarr(fov_store_path)
+    # Read tile shapes directly from .zarray JSON files (avoids opening full HCS store).
+    fov_store_p = Path(fov_store_path)
+    tile_shapes = {}
+    for tname in shifts.keys():
+        with open(fov_store_p / tname / "0" / ".zarray") as f:
+            meta = json.load(f)
+        tile_shapes[tname] = tuple(meta["shape"])
 
     # Determine target T,C,Z
-    tcz_list = [fov_store[tname].data.shape[:3] for tname in shifts.keys()]
+    tcz_list = [s[:3] for s in tile_shapes.values()]
     tcz_arr = xp.asarray(tcz_list)
     if tcz_policy == "min":
         tcz_target = (
@@ -626,14 +643,14 @@ def assemble_streaming(
     arr_out = stitched_pos["0"]
     dtype_idx = _resolve_shift_dtype(shifts, tile_size, base_bits=32)
 
-    # Precompute tile metadata for fast intersection checks
+    # Precompute tile metadata for fast intersection checks (using cached shapes)
     tile_meta = []
     for tile_name, shift in shifts.items():
-        tile_ref = fov_store[tile_name].data
+        ts = tile_shapes[tile_name]
         shift_array = xp.asarray(shift, dtype=dtype_idx)
-        t_end = min(tile_ref.shape[0], final_shape[0])
-        c_end = min(tile_ref.shape[1], final_shape[1])
-        z_end = min(tile_ref.shape[2], final_shape[2])
+        t_end = min(ts[0], final_shape[0])
+        c_end = min(ts[1], final_shape[1])
+        z_end = min(ts[2], final_shape[2])
         ys, ye = int(shift_array[0]), int(shift_array[0] + tile_size[0])
         xs, xe = int(shift_array[1]), int(shift_array[1] + tile_size[1])
         tile_meta.append((tile_name, t_end, c_end, z_end, ys, ye, xs, xe))
@@ -674,7 +691,7 @@ def assemble_streaming(
     _load_futures = deque()
     for i in range(min(_prefetch_depth, len(y_bands))):
         _load_futures.append(_pipeline_executor.submit(
-            _load_band_tiles, y_bands[i][2], fov_store, flipud, fliplr, rot90
+            _load_band_tiles, y_bands[i][2], fov_store_p, flipud, fliplr, rot90
         ))
 
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
@@ -689,7 +706,7 @@ def assemble_streaming(
         next_prefetch = band_idx + _prefetch_depth
         if next_prefetch < len(y_bands):
             _load_futures.append(_pipeline_executor.submit(
-                _load_band_tiles, y_bands[next_prefetch][2], fov_store, flipud, fliplr, rot90
+                _load_band_tiles, y_bands[next_prefetch][2], fov_store_p, flipud, fliplr, rot90
             ))
 
         print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles (waited {t_load_elapsed:.2f}s)")
@@ -723,6 +740,11 @@ def assemble_streaming(
                 arr_out, final_shape, y0, y1, tx, total_x,
                 _write_executor, _write_futures,
             )
+
+            # Release freed GPU memory back to CUDA so other parallel wells
+            # can allocate from it. CuPy's memory pool holds onto freed blocks
+            # by default, which causes OOM when multiple wells share one GPU.
+            xp.get_default_memory_pool().free_all_blocks()
 
             if profile:
                 print(f"  [Y-band {band_idx+1}/{len(y_bands)}] PROFILE: "
@@ -961,12 +983,20 @@ def stitch(
         group = get_group(key)
         grouped_shifts[group][key] = value
 
-    input_store = open_ome_zarr(input_store_path)
-    channel_names = input_store.channel_names
-    temp_pos = next(input_store.positions())[0]
-    tile_shape = input_store[temp_pos].data.shape
-    chunks_size = input_store[temp_pos].data.chunks
-    scale = input_store[temp_pos].scale
+    # Read metadata from a single position via direct JSON access.
+    # open_ome_zarr() parses the full HCS hierarchy (all 7035 positions) which
+    # takes minutes; reading one position's JSON files is instant.
+    input_store_p = Path(input_store_path)
+    first_pos_key = next(iter(all_shifts.keys()))  # e.g. "A/1/002026"
+    with open(input_store_p / first_pos_key / ".zattrs") as f:
+        pos_attrs = json.load(f)
+    channel_names = [c["label"] for c in pos_attrs["omero"]["channels"]]
+    scale_transforms = pos_attrs.get("multiscales", [{}])[0].get("datasets", [{}])[0].get("coordinateTransformations", [])
+    scale = tuple(scale_transforms[0]["scale"]) if scale_transforms and scale_transforms[0].get("type") == "scale" else None
+    with open(input_store_p / first_pos_key / "0" / ".zarray") as f:
+        arr_meta = json.load(f)
+    tile_shape = tuple(arr_meta["shape"])
+    chunks_size = tuple(arr_meta["chunks"])
     # Optional override for output chunking to improve viewer (dask/napari) responsiveness
     # Accept either full 5D "target_chunks" or YX-only via "target_chunks_yx"
     target_chunks = kwargs.get("target_chunks")
