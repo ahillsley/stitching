@@ -1,13 +1,11 @@
 # scripts to take the place of biahub-register
 
-import dexpv2
 import numpy as np
 from numpy.typing import ArrayLike
 import yaml
 import dask.array as da
 
 from iohub import open_ome_zarr
-import cupy as cp
 from pathlib import Path
 from iohub.ngff import TransformationMeta
 

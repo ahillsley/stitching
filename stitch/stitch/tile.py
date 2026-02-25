@@ -10,11 +10,6 @@ from tqdm import tqdm
 import scipy
 from typing import Optional
 
-if TYPE_CHECKING:
-    from dexp.processing.registration.model.translation_registration_model import (
-        TranslationRegistrationModel,
-    )
-
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
 )
