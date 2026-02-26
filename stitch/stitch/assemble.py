@@ -21,6 +21,12 @@ import threading
 import time
 from joblib import Parallel, delayed
 
+try:
+    from dask.distributed import LocalCluster, Client
+    _DASK_DISTRIBUTED_AVAILABLE = True
+except ImportError:
+    _DASK_DISTRIBUTED_AVAILABLE = False
+
 # Import GPU/CPU abstraction and helper functions from utils
 from stitch.stitch.utils import (
     xp,
@@ -37,6 +43,84 @@ from stitch.stitch.utils import (
     _resolve_shift_dtype,
     get_output_shape,
 )
+
+
+# ── Module-level per-process write pipeline ──────────────────────────────────
+# These persist across Dask tasks within the same worker process, enabling
+# write pipelining: band N's writes run in background while band N+1 loads+GPU.
+_band_write_pool = None
+_band_pending_futures = []
+_band_pending_data = []  # prevent GC of numpy arrays being written
+_band_write_submit_time = None  # wall-clock start of write submission
+_blosc_benchmark_done = False
+
+
+def _init_band_write_pool(max_workers=8):
+    """Get or create the persistent write thread pool for this worker process."""
+    global _band_write_pool
+    if _band_write_pool is None:
+        _band_write_pool = ThreadPoolExecutor(max_workers=max_workers)
+    return _band_write_pool
+
+
+def _wait_band_writes():
+    """Wait for all pending writes from the previous band, collect stats, free buffers."""
+    global _band_pending_futures, _band_pending_data, _band_write_submit_time
+    if not _band_pending_futures:
+        return
+    total_bytes = 0
+    block_times = []
+    for fut in _band_pending_futures:
+        data_bytes, elapsed = fut.result()
+        total_bytes += data_bytes
+        block_times.append(elapsed)
+    wall_time = time.time() - _band_write_submit_time if _band_write_submit_time else 0
+    n = len(block_times)
+    avg_t = sum(block_times) / n if n else 0
+    max_t = max(block_times) if block_times else 0
+    min_t = min(block_times) if block_times else 0
+    throughput = total_bytes / wall_time / 1e6 if wall_time > 0 else 0
+    print(f"[Write Stats] {n} blocks, {total_bytes/1e9:.2f}GB, "
+          f"wall={wall_time:.1f}s ({throughput:.0f}MB/s), "
+          f"per_block: min={min_t:.1f}s avg={avg_t:.1f}s max={max_t:.1f}s")
+    _band_pending_futures.clear()
+    _band_pending_data.clear()
+    _band_write_submit_time = None
+
+
+def _run_blosc_benchmark(sample_chunk):
+    """One-time blosc compression benchmark to separate compression vs I/O costs."""
+    global _blosc_benchmark_done
+    if _blosc_benchmark_done:
+        return
+    _blosc_benchmark_done = True
+    import numcodecs
+    codec = numcodecs.Blosc(cname='lz4', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
+    chunk_bytes = sample_chunk.nbytes
+    # Benchmark compression
+    t0 = time.time()
+    n_iters = 5
+    for _ in range(n_iters):
+        compressed = codec.encode(sample_chunk)
+    compress_time = (time.time() - t0) / n_iters
+    ratio = chunk_bytes / len(compressed)
+    # Estimate for full band: ~825 chunks, 8 writer threads
+    est_total = 825 * compress_time / 8
+    print(f"[Blosc Bench] chunk={chunk_bytes/1e6:.1f}MB, compress={compress_time*1000:.1f}ms, "
+          f"ratio={ratio:.1f}x, compressed={len(compressed)/1e6:.1f}MB, "
+          f"est_825_chunks_8threads={est_total:.1f}s (PID={os.getpid()})")
+
+
+def _compute_edt_weights(tile_size, blending_exponent, dtype_val):
+    """Compute EDT blending weights for a tile of the given size."""
+    ty, tx = int(tile_size[0]), int(tile_size[1])
+    _mask = xp.zeros((ty, tx), dtype=bool)
+    if ty > 2 and tx > 2:
+        _mask[1:-1, 1:-1] = True
+    _dist = cundi.distance_transform_edt(_mask).astype(xp.float32)
+    _dist += 1e-6
+    _weights = xp.where(_dist > 0, _dist ** float(blending_exponent), 0.0)
+    return xp.asarray(_weights, dtype=dtype_val)
 
 
 def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype_val, use_edt, tile_weights, stream=None, profile=False):
@@ -233,15 +317,19 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
         timings['n_tiles_hit'] = n_tiles_hit
         t_norm = time.time()
 
-    # Normalize
-    norm = xp.nan_to_num(numer / xp.maximum(denom, 1e-12))
+    # Normalize in-place to minimize GPU memory (avoids ~20GB of temporaries)
+    xp.maximum(denom, 1e-12, out=denom)
+    xp.divide(numer, denom, out=numer)
+    del denom
+    # Release CuPy memory pool's hold on denom + tile temporaries.
+    # Reduces GPU footprint from ~15GB to ~7GB before D2H, giving headroom for other workers.
+    xp.get_default_memory_pool().free_all_blocks()
+    xp.nan_to_num(numer, copy=False)
+    norm = numer  # just rename, no allocation
 
     if profile:
         xp.cuda.Device().synchronize()
         timings['normalize'] = time.time() - t_norm
-
-    # Free intermediates (keep norm)
-    del numer, denom
 
     if return_gpu:
         # Return GPU array — caller handles D2H (for pipelined transfer)
@@ -293,7 +381,10 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
     """Write a single normalized block to the output zarr array.
 
     Called from a background thread to overlap writes with GPU processing.
+    Returns (data_bytes, elapsed) for profiling.
     """
+    t0 = time.time()
+    data_bytes = norm_cpu.nbytes
     arr_out[
         (
             slice(0, final_shape[0]),
@@ -303,6 +394,7 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
             slice(x0, x1),
         )
     ] = norm_cpu
+    return data_bytes, time.time() - t0
 
 
 def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90):
@@ -531,7 +623,8 @@ def assemble_streaming(
     shifts: dict,
     tile_size: tuple,
     fov_store_path: str,
-    stitched_pos,
+    stitched_pos=None,
+    arr_out=None,
     flipud: bool = False,
     fliplr: bool = False,
     rot90: int = 0,
@@ -610,37 +703,29 @@ def assemble_streaming(
         chunks_size = (1, 1, 1, int(ty), int(tx))
 
     # Create output array on disk only (no auxiliary arrays)
-    try:
-        stitched_pos.create_zeros(
-            "0",
-            shape=final_shape,
-            chunks=chunks_size,
-            dtype=dtype_val,
-            transform=(
-                [TransformationMeta(type="scale", scale=scale)]
-                if scale is not None
-                else None
-            ),
-        )
-    except Exception:
-        pass
+    if arr_out is None:
+        try:
+            stitched_pos.create_zeros(
+                "0",
+                shape=final_shape,
+                chunks=chunks_size,
+                dtype=dtype_val,
+                transform=(
+                    [TransformationMeta(type="scale", scale=scale)]
+                    if scale is not None
+                    else None
+                ),
+            )
+        except Exception:
+            pass
 
     use_edt = str(blending_method).lower() == "edt"
 
     # Precompute EDT weights for one tile
-    if use_edt:
-        ty, tx = int(tile_size[0]), int(tile_size[1])
-        _mask = xp.zeros((ty, tx), dtype=bool)
-        if ty > 2 and tx > 2:
-            _mask[1:-1, 1:-1] = True
-        _dist = cundi.distance_transform_edt(_mask).astype(xp.float32)
-        _dist += 1e-6
-        _weights = xp.where(_dist > 0, _dist ** float(blending_exponent), 0.0)
-        tile_weights = xp.asarray(_weights, dtype=dtype_val)
-    else:
-        tile_weights = None
+    tile_weights = _compute_edt_weights(tile_size, blending_exponent, dtype_val) if use_edt else None
 
-    arr_out = stitched_pos["0"]
+    if arr_out is None:
+        arr_out = stitched_pos["0"]
     dtype_idx = _resolve_shift_dtype(shifts, tile_size, base_bits=32)
 
     # Precompute tile metadata for fast intersection checks (using cached shapes)
@@ -890,7 +975,7 @@ def assemble_streaming(
     print(f"  [Write drain] Waited {t_drain_elapsed:.2f}s for {len(_write_futures)} background writes"
           f"{f' ({n_failed} failed)' if n_failed else ''}")
 
-    return stitched_pos["0"]
+    return arr_out
 
 
 def _process_single_well(well_id, shifts, output_store, input_store_path, tile_shape,
@@ -943,6 +1028,271 @@ def _process_single_well(well_id, shifts, output_store, input_store_path, tile_s
         return well_id, False
 
 
+def _stitch_band_dask_worker(well_id, band_idx, y0, y1, y_tiles,
+                              output_store_path, input_store_path,
+                              final_shape, tile_size, tx,
+                              flipud, fliplr, rot90,
+                              blending_method, blending_exponent,
+                              value_precision_bits, cuda_path="",
+                              is_last_band=False):
+    """
+    Process one Y-band for one well. Self-contained Dask work unit.
+
+    Each worker runs in its own process with its own GIL and CUDA context.
+    Uses a persistent write pool to pipeline writes: band N's writes run in
+    background while band N+1 does load+GPU, cutting idle time significantly.
+    """
+    import numcodecs
+    numcodecs.blosc.set_nthreads(4)
+
+    # Ensure CUDA is findable for CuPy JIT kernel compilation
+    if cuda_path and 'CUDA_PATH' not in os.environ:
+        os.environ['CUDA_PATH'] = cuda_path
+
+    try:
+        t_start = time.time()
+
+        print(f"[Band Worker] Starting well={well_id} band={band_idx+1} "
+              f"y=[{y0}:{y1}] tiles={len(y_tiles)} (PID={os.getpid()})")
+
+        # Open output zarr array directly (instant, no HCS parsing)
+        arr_out = zarr.open(os.path.join(output_store_path, "A", well_id, "0", "0"), mode="r+")
+
+        # Compute EDT weights on this worker's GPU
+        dtype_val = _resolve_value_dtype(value_precision_bits)
+        use_edt = str(blending_method).lower() == "edt"
+        tile_weights = _compute_edt_weights(tile_size, blending_exponent, dtype_val) if use_edt else None
+
+        # Load tiles for this band
+        t_load = time.time()
+        fov_store_p = Path(input_store_path)
+        tile_cache = _load_band_tiles(y_tiles, fov_store_p, flipud, fliplr, rot90)
+        t_load_elapsed = time.time() - t_load
+
+        # GPU process this Y-band
+        t_gpu = time.time()
+        total_x = final_shape[-1]
+        norm_gpu = _process_y_band_gpu(
+            y0, y1, total_x, y_tiles, tile_cache, final_shape,
+            dtype_val, use_edt, tile_weights, return_gpu=True,
+        )
+        t_gpu_elapsed = time.time() - t_gpu
+
+        # D2H transfer
+        t_d2h = time.time()
+        norm_cpu = norm_gpu.get()
+        del norm_gpu, tile_cache
+        xp.get_default_memory_pool().free_all_blocks()
+        t_d2h_elapsed = time.time() - t_d2h
+
+        # Wait for previous band's writes AFTER load+GPU+D2H completes.
+        # This lets writes overlap with load+GPU of the current band.
+        # Requires enough CPUs (128) so write threads don't starve load threads.
+        t_wait = time.time()
+        _wait_band_writes()
+        t_wait_elapsed = time.time() - t_wait
+
+        # One-time blosc compression benchmark (first band only)
+        _run_blosc_benchmark(
+            np.ascontiguousarray(norm_cpu[0, 0, 0, :, :tx])
+        )
+
+        # Submit writes to persistent pool (non-blocking).
+        global _band_write_submit_time
+        _band_write_submit_time = time.time()
+        pool = _init_band_write_pool()
+        n_blocks = 0
+        for x0 in range(0, total_x, tx):
+            x1 = min(total_x, x0 + tx)
+            _band_pending_futures.append(pool.submit(
+                _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1,
+                norm_cpu[:, :, :, :, x0:x1]
+            ))
+            n_blocks += 1
+        # Keep norm_cpu alive until writes finish (prevent GC)
+        _band_pending_data.append(norm_cpu)
+        print(f"[Band Worker] Submitted {n_blocks} write blocks, "
+              f"{norm_cpu.nbytes/1e9:.2f}GB ({norm_cpu.dtype})")
+
+        # For the last band of a well, wait for writes to fully complete
+        if is_last_band:
+            t_flush = time.time()
+            _wait_band_writes()
+            t_flush_elapsed = time.time() - t_flush
+            print(f"[Band Worker] Final flush well={well_id}: {t_flush_elapsed:.1f}s")
+
+        t_total = time.time() - t_start
+        print(f"[Band Worker] Done well={well_id} band={band_idx+1} "
+              f"load={t_load_elapsed:.1f}s gpu={t_gpu_elapsed:.1f}s "
+              f"d2h={t_d2h_elapsed:.1f}s wait_prev={t_wait_elapsed:.1f}s total={t_total:.1f}s")
+        return well_id, band_idx, True
+
+    except Exception as e:
+        import traceback
+        print(f"[Band Worker] Failed well={well_id} band={band_idx+1}: {e}")
+        traceback.print_exc()
+        return well_id, band_idx, False
+
+
+# ---------------------------------------------------------------------------
+# Prefetch-enabled worker loop: processes a chunk of bands with tile
+# prefetching so that band N+1's tiles load while band N is on GPU.
+# ---------------------------------------------------------------------------
+
+# Module-level prefetch executor (one per Dask worker process, lazy-init)
+_prefetch_executor = None
+
+
+def _init_prefetch_executor():
+    global _prefetch_executor
+    if _prefetch_executor is None:
+        _prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="prefetch"
+        )
+    return _prefetch_executor
+
+
+def _stitch_bands_loop_worker(
+    band_list, output_store_path, input_store_path,
+    tile_size, tx, flipud, fliplr, rot90,
+    blending_method, blending_exponent,
+    value_precision_bits, cuda_path="",
+):
+    """Process multiple bands in sequence with tile prefetching.
+
+    Each Dask worker is assigned a chunk of bands. While the GPU processes
+    band N, a background thread prefetches tiles for band N+1, hiding load
+    latency behind GPU computation (which releases the GIL).
+    """
+    import numcodecs
+    numcodecs.blosc.set_nthreads(4)
+
+    if cuda_path and 'CUDA_PATH' not in os.environ:
+        os.environ['CUDA_PATH'] = cuda_path
+
+    fov_store_p = Path(input_store_path)
+    dtype_val = _resolve_value_dtype(value_precision_bits)
+    use_edt = str(blending_method).lower() == "edt"
+    tile_weights = (
+        _compute_edt_weights(tile_size, blending_exponent, dtype_val)
+        if use_edt else None
+    )
+
+    prefetch_pool = _init_prefetch_executor()
+    prefetch_future = None
+    results = []
+
+    for i, (well_id, band_idx, y0, y1, y_tiles, final_shape, is_last) in enumerate(band_list):
+        try:
+            t_start = time.time()
+            print(
+                f"[Band Worker] Starting well={well_id} band={band_idx+1} "
+                f"y=[{y0}:{y1}] tiles={len(y_tiles)} (PID={os.getpid()})"
+            )
+
+            arr_out = zarr.open(
+                os.path.join(output_store_path, "A", well_id, "0", "0"),
+                mode="r+",
+            )
+
+            # ---- Load tiles: from prefetch or blocking load ----
+            t_load = time.time()
+            if prefetch_future is not None:
+                tile_cache = prefetch_future.result()
+                t_load_elapsed = time.time() - t_load
+                load_src = "prefetch"
+            else:
+                tile_cache = _load_band_tiles(
+                    y_tiles, fov_store_p, flipud, fliplr, rot90
+                )
+                t_load_elapsed = time.time() - t_load
+                load_src = "cold"
+
+            # ---- Start prefetching next band BEFORE GPU work ----
+            # GPU releases GIL → prefetch threads get uncontested GIL access
+            prefetch_future = None
+            if i + 1 < len(band_list):
+                next_y_tiles = band_list[i + 1][4]  # y_tiles field
+                prefetch_future = prefetch_pool.submit(
+                    _load_band_tiles,
+                    next_y_tiles, fov_store_p, flipud, fliplr, rot90,
+                )
+
+            # ---- GPU process this Y-band ----
+            t_gpu = time.time()
+            total_x = final_shape[-1]
+            norm_gpu = _process_y_band_gpu(
+                y0, y1, total_x, y_tiles, tile_cache, final_shape,
+                dtype_val, use_edt, tile_weights, return_gpu=True,
+            )
+            t_gpu_elapsed = time.time() - t_gpu
+
+            # ---- D2H transfer ----
+            t_d2h = time.time()
+            norm_cpu = norm_gpu.get()
+            del norm_gpu, tile_cache
+            xp.get_default_memory_pool().free_all_blocks()
+            t_d2h_elapsed = time.time() - t_d2h
+
+            # ---- Wait for previous band's writes ----
+            t_wait = time.time()
+            _wait_band_writes()
+            t_wait_elapsed = time.time() - t_wait
+
+            # One-time blosc benchmark
+            _run_blosc_benchmark(
+                np.ascontiguousarray(norm_cpu[0, 0, 0, :, :tx])
+            )
+
+            # ---- Submit writes to persistent pool (non-blocking) ----
+            global _band_write_submit_time
+            _band_write_submit_time = time.time()
+            pool = _init_band_write_pool()
+            n_blocks = 0
+            for x0 in range(0, total_x, tx):
+                x1 = min(total_x, x0 + tx)
+                _band_pending_futures.append(pool.submit(
+                    _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1,
+                    norm_cpu[:, :, :, :, x0:x1],
+                ))
+                n_blocks += 1
+            _band_pending_data.append(norm_cpu)
+            print(
+                f"[Band Worker] Submitted {n_blocks} write blocks, "
+                f"{norm_cpu.nbytes/1e9:.2f}GB ({norm_cpu.dtype})"
+            )
+
+            # Flush on last band of a well
+            if is_last:
+                t_flush = time.time()
+                _wait_band_writes()
+                t_flush_elapsed = time.time() - t_flush
+                print(
+                    f"[Band Worker] Final flush well={well_id}: "
+                    f"{t_flush_elapsed:.1f}s"
+                )
+
+            t_total = time.time() - t_start
+            print(
+                f"[Band Worker] Done well={well_id} band={band_idx+1} "
+                f"load={t_load_elapsed:.1f}s({load_src}) "
+                f"gpu={t_gpu_elapsed:.1f}s d2h={t_d2h_elapsed:.1f}s "
+                f"wait_prev={t_wait_elapsed:.1f}s total={t_total:.1f}s"
+            )
+            results.append((well_id, band_idx, True))
+
+        except Exception as e:
+            import traceback
+            print(f"[Band Worker] Failed well={well_id} band={band_idx+1}: {e}")
+            traceback.print_exc()
+            results.append((well_id, band_idx, False))
+
+    # Final flush: ensure all pending writes complete before returning
+    _wait_band_writes()
+
+    return results
+
+
 def stitch(
     config_path: str,
     input_store_path: str,
@@ -951,7 +1301,7 @@ def stitch(
     fliplr: bool = False,
     rot90: int = 0,
     blending_method: Literal["average", "edt"] = "edt",
-    parallel_mode: Literal["auto", "wells", "y_bands", "sequential"] = "auto",
+    parallel_mode: Literal["auto", "wells", "wells_threads", "y_bands", "sequential"] = "auto",
     **kwargs,
 ):
     """Mimic of biahub stitch function
@@ -965,8 +1315,9 @@ def stitch(
         rot90: Number of 90-degree rotations to apply
         blending_method: 'average' or 'edt' for blending overlapping tiles
         parallel_mode: Parallelization strategy:
-            - "auto" (default): GPU uses parallel wells, CPU uses parallel Y-bands
-            - "wells": Force parallel well processing (ThreadPoolExecutor)
+            - "auto" (default): GPU + Dask uses multiprocess wells, GPU without Dask uses threaded wells, CPU uses parallel Y-bands
+            - "wells": Force parallel well processing (Dask multiprocessing if available, else threads)
+            - "wells_threads": Force parallel well processing via ThreadPoolExecutor (legacy)
             - "y_bands": Force parallel Y-band processing (joblib)
             - "sequential": No parallelization
         **kwargs: Additional arguments passed to assemble_streaming()
@@ -1021,21 +1372,32 @@ def stitch(
     print("output store created")
 
     # Determine parallelization strategy based on parallel_mode and hardware
-    use_parallel_wells = False
+    use_dask_wells = False
+    use_thread_wells = False
     use_parallel_y_bands = False
     n_workers = None
 
     if parallel_mode == "auto":
-        if _USING_CUPY:
-            use_parallel_wells = True  # GPU: parallel wells via ThreadPoolExecutor
-            print("[stitch] Auto mode: GPU detected, using parallel wells strategy")
+        if _USING_CUPY and _DASK_DISTRIBUTED_AVAILABLE:
+            use_dask_wells = True
+            print("[stitch] Auto mode: GPU + Dask detected, using Dask multiprocess wells strategy")
+        elif _USING_CUPY:
+            use_thread_wells = True
+            print("[stitch] Auto mode: GPU detected (no Dask), using threaded wells strategy")
         else:
-            use_parallel_y_bands = True  # CPU: parallel Y-bands via joblib
+            use_parallel_y_bands = True
             n_workers = _get_optimal_workers(use_gpu=False, verbose=True)
             print(f"[stitch] Auto mode: CPU detected, using parallel Y-bands strategy ({n_workers} workers)")
     elif parallel_mode == "wells":
-        use_parallel_wells = True
-        print("[stitch] Forced parallel wells strategy")
+        if _DASK_DISTRIBUTED_AVAILABLE:
+            use_dask_wells = True
+            print("[stitch] Forced Dask multiprocess wells strategy")
+        else:
+            use_thread_wells = True
+            print("[stitch] Forced threaded wells strategy (Dask unavailable)")
+    elif parallel_mode == "wells_threads":
+        use_thread_wells = True
+        print("[stitch] Forced threaded wells strategy (legacy)")
     elif parallel_mode == "y_bands":
         use_parallel_y_bands = True
         n_workers = _get_optimal_workers(use_gpu=False, verbose=True)
@@ -1046,19 +1408,188 @@ def stitch(
     well_ids = list(grouped_shifts.keys())
     num_wells = len(well_ids)
 
-    # Thread lock for thread-safe zarr store operations
-    well_lock = threading.Lock()
+    if use_dask_wells:
+        # DASK BAND-LEVEL PARALLEL PROCESSING
+        # Break work into (well, Y-band) pairs for fine-grained parallelism.
+        # Workers naturally desynchronize — some load tiles while others use GPU.
+        print(f"[Dask Bands] Processing {num_wells} wells with band-level Dask parallelism")
+        print(f"[Dask Bands] Wells: {well_ids}")
 
-    if use_parallel_wells:
-        # PARALLEL WELL PROCESSING - Process wells in parallel using ThreadPoolExecutor
-        max_workers = min(4, num_wells)  # Limit to 4 parallel wells to avoid resource contention
+        # Resolve divide_tile_size for Y-band computation and write chunking
+        divide_tile_yx = kwargs.get("target_chunks_yx", (2048, 2048))
+        ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
+        blending_exponent = kwargs.get("blending_exponent", 1.0)
+        value_precision_bits = kwargs.get("value_precision_bits", 32)
+        dtype_val = _resolve_value_dtype(value_precision_bits)
 
-        print(f"[Parallel Wells] Processing {num_wells} wells with {max_workers} parallel workers")
-        print(f"[Parallel Wells] Wells: {well_ids}")
+        # Phase 1: Pre-create wells, compute Y-bands, build interleaved work queue
+        work_queue = []
+        fov_store_p = Path(input_store_path)
 
-        # Use ThreadPoolExecutor for parallel well processing
+        for well_id in well_ids:
+            well_shifts = grouped_shifts[well_id]
+            final_shape_xy = get_output_shape(well_shifts, tile_shape[-2:])
+
+            # Determine T,C,Z from tile metadata
+            first_tile_key = next(iter(well_shifts.keys()))
+            with open(fov_store_p / first_tile_key / "0" / ".zarray") as f:
+                meta = json.load(f)
+            first_tile_shape = tuple(meta["shape"])
+            final_shape = first_tile_shape[:3] + final_shape_xy
+
+            # Create output position + zeros via iohub
+            stitched_pos = output_store.create_position("A", well_id, "0")
+            stitched_pos.create_zeros(
+                "0",
+                shape=final_shape,
+                chunks=chunks_size,
+                dtype=dtype_val,
+                transform=(
+                    [TransformationMeta(type="scale", scale=scale)]
+                    if scale is not None
+                    else None
+                ),
+            )
+
+            # Pre-compute tile metadata (same logic as assemble_streaming)
+            dtype_idx = _resolve_shift_dtype(well_shifts, tile_shape[-2:], base_bits=32)
+            tile_shapes = {}
+            for tname in well_shifts.keys():
+                with open(fov_store_p / tname / "0" / ".zarray") as f:
+                    tmeta = json.load(f)
+                tile_shapes[tname] = tuple(tmeta["shape"])
+
+            tile_meta = []
+            for tile_name, shift in well_shifts.items():
+                ts = tile_shapes[tile_name]
+                t_end = min(ts[0], final_shape[0])
+                c_end = min(ts[1], final_shape[1])
+                z_end = min(ts[2], final_shape[2])
+                ys = int(shift[0])
+                ye = int(shift[0] + tile_shape[-2])
+                xs = int(shift[1])
+                xe = int(shift[1] + tile_shape[-1])
+                tile_meta.append((tile_name, t_end, c_end, z_end, ys, ye, xs, xe))
+
+            # Pre-identify Y-bands and their contributing tiles
+            total_y = final_shape[-2]
+            n_bands = len(range(0, total_y, ty_band))
+            for band_idx, y0 in enumerate(range(0, total_y, ty_band)):
+                y1 = min(total_y, y0 + ty_band)
+                y_tiles = [
+                    (nm, t_end, c_end, z_end, ys, ye, xs, xe)
+                    for (nm, t_end, c_end, z_end, ys, ye, xs, xe) in tile_meta
+                    if not (ye <= y0 or ys >= y1)
+                ]
+                is_last = (band_idx == n_bands - 1)
+                work_queue.append((well_id, band_idx, y0, y1, y_tiles, final_shape, is_last))
+
+            print(f"[Dask Bands] Well {well_id}: shape={final_shape}, {n_bands} bands")
+
+        # Interleave work queue: w1b1, w2b1, w3b1, w1b2, w2b2, w3b2, ...
+        # Keeps consecutive tasks on different wells → less filesystem cache thrashing
+        work_queue.sort(key=lambda x: (x[1], well_ids.index(x[0])))
+        print(f"[Dask Bands] Total work units: {len(work_queue)} (interleaved)")
+
+        # Capture CUDA_PATH for worker processes (needed for CuPy JIT compilation)
+        cuda_path = os.environ.get('CUDA_PATH', os.environ.get('CUDA_HOME', ''))
+
+        # Close the output store before spawning workers
+        output_store.close()
+        del output_store
+
+        # Phase 2: Launch Dask LocalCluster with band-level workers
+        # Peak ~27GB GPU per band (numer+denom+tiles).
+        # Scale workers to fit available VRAM: 3 for H200 (141GB), 2 for A100/H100 (80GB).
+        gpu_mem_bytes = xp.cuda.Device().mem_info[1] if _USING_CUPY else 0
+        gpu_mem_gb = gpu_mem_bytes / 1e9
+        # Peak ~15GB GPU per worker (numer+denom+tile temps in float16, threads_per_worker=1).
+        # free_all_blocks() after del denom drops to ~7GB before D2H.
+        # Use 18GB divisor: 80GB→4, 141GB→7.
+        max_gpu_workers = max(1, int(gpu_mem_gb // 18))
+        n_dask_workers = min(max_gpu_workers, len(work_queue))
+        print(f"[Dask Bands] GPU memory: {gpu_mem_gb:.0f}GB → {n_dask_workers} workers")
+        # threads_per_worker=1: each worker runs one long-lived task (loop
+        # over its assigned bands). Write pipelining + prefetch use module-
+        # level state that is NOT thread-safe.
+        if cuda_path:
+            os.environ['CUDA_PATH'] = cuda_path  # workers inherit parent env
+        # Disable Dask's per-worker memory limit — workers hold ~28-42GB each
+        # (current tile_cache + prefetched tile_cache + norm_cpu + prev norm_cpu).
+        cluster = LocalCluster(n_workers=n_dask_workers, threads_per_worker=1,
+                               memory_limit=0)
+        client = Client(cluster)
+        try:
+            print(f"[Dask Bands] LocalCluster started: {n_dask_workers} workers, 1 thread each")
+
+            # Distribute work round-robin so each worker gets interleaved bands
+            worker_chunks = [[] for _ in range(n_dask_workers)]
+            for i, item in enumerate(work_queue):
+                worker_chunks[i % n_dask_workers].append(item)
+
+            chunk_sizes = [len(c) for c in worker_chunks]
+            print(f"[Dask Bands] Chunks per worker: {chunk_sizes} (prefetch enabled)")
+
+            futures = []
+            for chunk in worker_chunks:
+                if not chunk:
+                    continue
+                future = client.submit(
+                    _stitch_bands_loop_worker,
+                    band_list=chunk,
+                    output_store_path=output_store_path,
+                    input_store_path=input_store_path,
+                    tile_size=tile_shape[-2:],
+                    tx=tx_write,
+                    flipud=flipud,
+                    fliplr=fliplr,
+                    rot90=rot90,
+                    blending_method=blending_method,
+                    blending_exponent=blending_exponent,
+                    value_precision_bits=value_precision_bits,
+                    cuda_path=cuda_path,
+                )
+                futures.append(future)
+
+            # Gather results from all worker loops
+            completed = []
+            failed = []
+            for future in futures:
+                try:
+                    results_list = future.result()
+                    for well_id, band_idx, success in results_list:
+                        if success:
+                            completed.append((well_id, band_idx))
+                        else:
+                            failed.append((well_id, band_idx))
+                except Exception as e:
+                    print(f"[Dask Bands] Worker exception: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        finally:
+            try:
+                client.close()
+                cluster.close(timeout=120)
+            except Exception:
+                pass
+
+        print(f"[Dask Bands] Completed: {len(completed)}/{len(work_queue)} bands")
+        if failed:
+            print(f"[Dask Bands] Failed bands: {failed}")
+            raise RuntimeError(f"Failed to process {len(failed)} bands: {failed}")
+
+        print(f"[Dask Bands] All {len(work_queue)} bands processed successfully!")
+
+    elif use_thread_wells:
+        # THREADED WELL PROCESSING (legacy fallback) — GIL limits true parallelism
+        well_lock = threading.Lock()
+        max_workers = min(4, num_wells)
+
+        print(f"[Thread Wells] Processing {num_wells} wells with {max_workers} thread workers")
+        print(f"[Thread Wells] Wells: {well_ids}")
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all well processing tasks
             futures = []
             for well_id in well_ids:
                 shifts = grouped_shifts[well_id]
@@ -1070,10 +1601,8 @@ def stitch(
                 )
                 futures.append((well_id, future))
 
-            # Wait for all wells to complete and collect results
             completed_wells = []
             failed_wells = []
-
             for well_id, future in futures:
                 try:
                     result_well_id, success = future.result()
@@ -1082,19 +1611,19 @@ def stitch(
                     else:
                         failed_wells.append(result_well_id)
                 except Exception as e:
-                    print(f"[Parallel Wells] Exception in well {well_id}: {e}")
+                    print(f"[Thread Wells] Exception in well {well_id}: {e}")
                     failed_wells.append(well_id)
 
-        # Report final results
-        print(f"[Parallel Wells] Completed: {len(completed_wells)} wells: {completed_wells}")
+        print(f"[Thread Wells] Completed: {len(completed_wells)} wells: {completed_wells}")
         if failed_wells:
-            print(f"[Parallel Wells] Failed: {len(failed_wells)} wells: {failed_wells}")
+            print(f"[Thread Wells] Failed: {len(failed_wells)} wells: {failed_wells}")
             raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
 
-        print(f"[Parallel Wells] All {num_wells} wells processed successfully!")
+        print(f"[Thread Wells] All {num_wells} wells processed successfully!")
 
     else:
         # SEQUENTIAL WELL PROCESSING with optional parallel Y-bands
+        well_lock = threading.Lock()
         print(f"[Sequential Wells] Processing {num_wells} wells: {well_ids}")
 
         completed_wells = []
