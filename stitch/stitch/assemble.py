@@ -55,6 +55,125 @@ _band_write_submit_time = None  # wall-clock start of write submission
 _blosc_benchmark_done = False
 
 
+# ── CPU / IO monitoring ──────────────────────────────────────────────────────
+
+def _read_proc_stat(pid):
+    """Read /proc/[pid]/stat for CPU ticks, thread count, RSS."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+        # utime(13), stime(14), num_threads(19), rss(23)
+        cpu_ticks = int(fields[13]) + int(fields[14])
+        num_threads = int(fields[19])
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        rss_mb = int(fields[23]) * page_size / 1e6
+        return cpu_ticks, num_threads, rss_mb
+    except (FileNotFoundError, PermissionError, IndexError, ValueError):
+        return None, None, None
+
+
+def _read_proc_io(pid):
+    """Read /proc/[pid]/io for read/write bytes."""
+    try:
+        with open(f"/proc/{pid}/io") as f:
+            data = {}
+            for line in f:
+                k, v = line.split(":")
+                data[k.strip()] = int(v.strip())
+        return data.get("read_bytes", 0), data.get("write_bytes", 0)
+    except (FileNotFoundError, PermissionError, ValueError):
+        return 0, 0
+
+
+def _get_child_pids(parent_pid):
+    """Get direct child PIDs via /proc/[pid]/task/[tid]/children."""
+    children = []
+    try:
+        task_dir = f"/proc/{parent_pid}/task"
+        for tid in os.listdir(task_dir):
+            child_file = f"{task_dir}/{tid}/children"
+            try:
+                with open(child_file) as f:
+                    for pid_str in f.read().split():
+                        children.append(int(pid_str))
+            except (FileNotFoundError, PermissionError, ValueError):
+                continue
+    except (FileNotFoundError, PermissionError):
+        pass
+    return list(set(children))
+
+
+def _cpu_monitor_loop(stop_event, interval, n_cores):
+    """Background thread: log per-worker CPU%, thread count, IO rates every interval."""
+    clk_tck = os.sysconf("SC_CLK_TCK")
+    pid = os.getpid()
+    prev = {}  # pid -> (cpu_ticks, read_bytes, write_bytes)
+
+    while not stop_event.wait(interval):
+        children = _get_child_pids(pid)
+        all_pids = [pid] + children
+
+        total_cpu_pct = 0.0
+        total_threads = 0
+        total_rss = 0.0
+        total_read_rate = 0.0
+        total_write_rate = 0.0
+        worker_parts = []
+
+        for p in all_pids:
+            cpu_ticks, n_threads, rss_mb = _read_proc_stat(p)
+            if cpu_ticks is None:
+                continue
+            read_bytes, write_bytes = _read_proc_io(p)
+
+            prev_vals = prev.get(p)
+            if prev_vals:
+                dt_cpu = cpu_ticks - prev_vals[0]
+                dt_read = read_bytes - prev_vals[1]
+                dt_write = write_bytes - prev_vals[2]
+                cpu_pct = 100.0 * dt_cpu / (clk_tck * interval)
+                read_rate = dt_read / interval / 1e6  # MB/s
+                write_rate = dt_write / interval / 1e6  # MB/s
+            else:
+                cpu_pct = read_rate = write_rate = 0.0
+
+            prev[p] = (cpu_ticks, read_bytes, write_bytes)
+            total_cpu_pct += cpu_pct
+            total_threads += n_threads
+            total_rss += rss_mb
+            total_read_rate += read_rate
+            total_write_rate += write_rate
+
+            if p != pid:
+                worker_parts.append(f"{cpu_pct:.0f}%/{n_threads}t")
+
+        core_util = total_cpu_pct / n_cores if n_cores > 0 else 0
+        workers_str = " ".join(worker_parts) if worker_parts else "none"
+        print(
+            f"[CPU Monitor] cores={core_util:.0f}%of{n_cores} "
+            f"total_cpu={total_cpu_pct:.0f}% threads={total_threads} "
+            f"rss={total_rss/1e3:.1f}GB "
+            f"read={total_read_rate:.0f}MB/s write={total_write_rate:.0f}MB/s "
+            f"workers=[{workers_str}]"
+        )
+
+    # Final snapshot
+    print("[CPU Monitor] stopped")
+
+
+def _start_cpu_monitor(interval=5.0, n_cores=32):
+    """Start background CPU/IO monitor. Returns stop_event to signal shutdown."""
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_cpu_monitor_loop,
+        args=(stop_event, interval, n_cores),
+        daemon=True,
+        name="cpu-monitor",
+    )
+    t.start()
+    return stop_event
+
+
 def _init_band_write_pool(max_workers=8):
     """Get or create the persistent write thread pool for this worker process."""
     global _band_write_pool
@@ -95,7 +214,7 @@ def _run_blosc_benchmark(sample_chunk):
         return
     _blosc_benchmark_done = True
     import numcodecs
-    codec = numcodecs.Blosc(cname='lz4', clevel=5, shuffle=numcodecs.Blosc.BITSHUFFLE)
+    codec = numcodecs.Blosc(cname='lz4', clevel=1, shuffle=numcodecs.Blosc.BITSHUFFLE)
     chunk_bytes = sample_chunk.nbytes
     # Benchmark compression
     t0 = time.time()
@@ -1451,6 +1570,28 @@ def stitch(
                 ),
             )
 
+            # Override compressor: lz4 is 3x faster than zstd on dense
+            # float16 image data (5ms vs 16ms per 8MB chunk) with the same
+            # compression ratio (~2.1x). iohub hardcodes zstd; patch .zarray.
+            zarray_path = (
+                Path(output_store_path) / "A" / well_id / "0" / "0" / ".zarray"
+            )
+            if zarray_path.exists():
+                with open(zarray_path) as f:
+                    zmeta = json.load(f)
+                old_cname = zmeta.get("compressor", {}).get("cname", "?")
+                zmeta["compressor"] = {
+                    "id": "blosc",
+                    "cname": "lz4",
+                    "clevel": 1,
+                    "shuffle": 2,  # BITSHUFFLE
+                    "blocksize": 0,
+                }
+                with open(zarray_path, "w") as f:
+                    json.dump(zmeta, f)
+                if well_id == well_ids[0]:
+                    print(f"[Dask Bands] Compressor: {old_cname} -> lz4 (3x faster on dense float16)")
+
             # Pre-compute tile metadata (same logic as assemble_streaming)
             dtype_idx = _resolve_shift_dtype(well_shifts, tile_shape[-2:], base_bits=32)
             tile_shapes = {}
@@ -1519,8 +1660,13 @@ def stitch(
         cluster = LocalCluster(n_workers=n_dask_workers, threads_per_worker=1,
                                memory_limit=0)
         client = Client(cluster)
+        cpu_monitor_stop = None
         try:
             print(f"[Dask Bands] LocalCluster started: {n_dask_workers} workers, 1 thread each")
+
+            # Start CPU/IO monitor (reads /proc for per-worker stats every 5s)
+            n_cores = int(os.environ.get("SLURM_CPUS_PER_TASK", 32))
+            cpu_monitor_stop = _start_cpu_monitor(interval=5.0, n_cores=n_cores)
 
             # Distribute work round-robin so each worker gets interleaved bands
             worker_chunks = [[] for _ in range(n_dask_workers)]
@@ -1568,6 +1714,8 @@ def stitch(
                     traceback.print_exc()
 
         finally:
+            if cpu_monitor_stop is not None:
+                cpu_monitor_stop.set()
             try:
                 client.close()
                 cluster.close(timeout=120)

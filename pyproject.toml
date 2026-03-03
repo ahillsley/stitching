@@ -14,7 +14,7 @@ authors = [
 dependencies = [
     "numpy",
     "scipy",
-    "dask[array]",
+    "dask[array,distributed]",
     "zarr",
     "tqdm",
     "pyyaml",
