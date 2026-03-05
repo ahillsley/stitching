@@ -270,8 +270,13 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
     if profile:
         xp.cuda.Device().synchronize()
         timings['alloc'] = time.time() - t0
+        mempool = xp.get_default_memory_pool()
+        timings['alloc_gpu_mb'] = mempool.used_bytes() / 1e6
         t_accum_start = time.time()
         n_tiles_hit = 0
+        t_slice_cpu_total = 0.0
+        t_h2d_total = 0.0
+        t_gpu_kernel_total = 0.0
 
     for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
         iy0 = max(y0, ys)
@@ -282,6 +287,8 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
             continue
 
         tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+        if profile:
+            t_sl = time.time()
         out_sl = (
             slice(0, t_end),
             slice(0, c_end),
@@ -296,29 +303,44 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
             slice(iy0 - ys, iy1 - ys),
             slice(ix0 - xs, ix1 - xs),
         )
+        cpu_slice = tile_full[tile_sl]
+        if profile:
+            t_slice_cpu_total += time.time() - t_sl
+            t_h = time.time()
+
         # Slice on CPU first (cheap numpy indexing), then transfer to GPU
-        block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
+        block = xp.asarray(cpu_slice, dtype=dtype_val)
 
         if use_edt:
             wloc = tile_weights[
                 (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
             ]
             wloc = xp.asarray(wloc, dtype=dtype_val)
+            if profile:
+                t_h2d_total += time.time() - t_h
+                t_k = time.time()
             nz = block != 0
             wloc = wloc * nz
             numer[out_sl] += block * wloc
             denom[out_sl] += wloc
         else:
+            if profile:
+                t_h2d_total += time.time() - t_h
+                t_k = time.time()
             numer[out_sl] += block
             denom[out_sl] += (block != 0).astype(dtype_val)
 
         if profile:
+            t_gpu_kernel_total += time.time() - t_k
             n_tiles_hit += 1
 
     if profile:
         xp.cuda.Device().synchronize()
         timings['accum'] = time.time() - t_accum_start
         timings['n_tiles_hit'] = n_tiles_hit
+        timings['slice_cpu'] = t_slice_cpu_total
+        timings['h2d'] = t_h2d_total
+        timings['gpu_kernel'] = t_gpu_kernel_total
         t_norm = time.time()
 
     # Normalize in-place to minimize GPU memory (avoids ~20GB of temporaries)
@@ -334,6 +356,8 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
     if profile:
         xp.cuda.Device().synchronize()
         timings['normalize'] = time.time() - t_norm
+        mempool = xp.get_default_memory_pool()
+        timings['post_norm_gpu_mb'] = mempool.used_bytes() / 1e6
 
     if return_gpu:
         # Return GPU array — caller handles D2H (for pipelined transfer)
@@ -1175,11 +1199,15 @@ def _stitch_bands_loop_worker(
     band N, a background thread prefetches tiles for band N+1, hiding load
     latency behind GPU computation (which releases the GIL).
     """
+    from datetime import datetime
+
     import numcodecs
     numcodecs.blosc.set_nthreads(4)
 
     if cuda_path and 'CUDA_PATH' not in os.environ:
         os.environ['CUDA_PATH'] = cuda_path
+
+    profile = os.environ.get("STITCH_PROFILE", "").strip() in ("1", "true", "yes")
 
     fov_store_p = Path(input_store_path)
     dtype_val = _resolve_value_dtype(value_precision_bits)
@@ -1194,10 +1222,12 @@ def _stitch_bands_loop_worker(
     results = []
 
     for i, (well_id, band_idx, y0, y1, y_tiles, final_shape, is_last) in enumerate(band_list):
+        gpu_timings = None
         try:
             t_start = time.time()
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
             print(
-                f"[Band Worker] Starting well={well_id} band={band_idx+1} "
+                f"[{ts}] [Band Worker] Starting well={well_id} band={band_idx+1} "
                 f"y=[{y0}:{y1}] tiles={len(y_tiles)} (PID={os.getpid()})"
             )
 
@@ -1232,10 +1262,15 @@ def _stitch_bands_loop_worker(
             # ---- GPU process this Y-band ----
             t_gpu = time.time()
             total_x = final_shape[-1]
-            norm_gpu = _process_y_band_gpu(
+            gpu_result = _process_y_band_gpu(
                 y0, y1, total_x, y_tiles, tile_cache, final_shape,
                 dtype_val, use_edt, tile_weights, return_gpu=True,
+                profile=profile,
             )
+            if profile:
+                norm_gpu, gpu_timings = gpu_result
+            else:
+                norm_gpu = gpu_result
             t_gpu_elapsed = time.time() - t_gpu
 
             # ---- D2H transfer ----
@@ -1284,12 +1319,26 @@ def _stitch_bands_loop_worker(
                 )
 
             t_total = time.time() - t_start
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
             print(
-                f"[Band Worker] Done well={well_id} band={band_idx+1} "
+                f"[{ts}] [Band Worker] Done well={well_id} band={band_idx+1} "
                 f"load={t_load_elapsed:.1f}s({load_src}) "
                 f"gpu={t_gpu_elapsed:.1f}s d2h={t_d2h_elapsed:.1f}s "
                 f"wait_prev={t_wait_elapsed:.1f}s total={t_total:.1f}s"
             )
+            if profile and gpu_timings:
+                gt = gpu_timings
+                print(
+                    f"  [GPU detail] alloc={gt.get('alloc',0):.2f}s "
+                    f"accum={gt.get('accum',0):.2f}s "
+                    f"({gt.get('n_tiles_hit',0)} tiles: "
+                    f"slice_cpu={gt.get('slice_cpu',0):.2f}s "
+                    f"h2d={gt.get('h2d',0):.2f}s "
+                    f"gpu_kernel={gt.get('gpu_kernel',0):.2f}s) "
+                    f"norm={gt.get('normalize',0):.2f}s "
+                    f"gpu_mem: alloc={gt.get('alloc_gpu_mb',0):.0f}MB "
+                    f"post_norm={gt.get('post_norm_gpu_mb',0):.0f}MB"
+                )
             results.append((well_id, band_idx, True))
 
         except Exception as e:
@@ -1423,6 +1472,7 @@ def stitch(
         # DASK BAND-LEVEL PARALLEL PROCESSING
         # Break work into (well, Y-band) pairs for fine-grained parallelism.
         # Workers naturally desynchronize — some load tiles while others use GPU.
+        t_phase1 = time.time()
         print(f"[Dask Bands] Processing {num_wells} wells with band-level Dask parallelism")
         print(f"[Dask Bands] Wells: {well_ids}")
 
@@ -1522,7 +1572,9 @@ def stitch(
         # Interleave work queue: w1b1, w2b1, w3b1, w1b2, w2b2, w3b2, ...
         # Keeps consecutive tasks on different wells → less filesystem cache thrashing
         work_queue.sort(key=lambda x: (x[1], well_ids.index(x[0])))
+        t_phase1_elapsed = time.time() - t_phase1
         print(f"[Dask Bands] Total work units: {len(work_queue)} (interleaved)")
+        print(f"[Dask Bands] Phase 1 (store creation + metadata): {t_phase1_elapsed:.1f}s")
 
         # Capture CUDA_PATH for worker processes (needed for CuPy JIT compilation)
         cuda_path = os.environ.get('CUDA_PATH', os.environ.get('CUDA_HOME', ''))
@@ -1532,29 +1584,52 @@ def stitch(
         del output_store
 
         # Phase 2: Launch Dask LocalCluster with band-level workers
-        # Peak ~27GB GPU per band (numer+denom+tiles).
-        # Scale workers to fit available VRAM: 3 for H200 (141GB), 2 for A100/H100 (80GB).
-        gpu_mem_bytes = xp.cuda.Device().mem_info[1] if _USING_CUPY else 0
-        gpu_mem_gb = gpu_mem_bytes / 1e9
-        # Peak ~15GB GPU per worker (numer+denom+tile temps in float16, threads_per_worker=1).
-        # free_all_blocks() after del denom drops to ~7GB before D2H.
-        # Use 18GB divisor: 80GB→4, 141GB→7.
-        max_gpu_workers = max(1, int(gpu_mem_gb // 18))
-        n_dask_workers = min(max_gpu_workers, len(work_queue))
-        print(f"[Dask Bands] GPU memory: {gpu_mem_gb:.0f}GB → {n_dask_workers} workers")
+        t_phase2 = time.time()
+
+        # Detect available GPUs and scale workers across all devices.
+        # Peak ~15GB GPU per worker (numer+denom+tile temps in float16).
+        # Use 18GB divisor per device: A100-80GB→4/gpu, H200-141GB→7/gpu, A40-48GB→2/gpu.
+        from ops_utils.hpc.gpu_utils import _setup_gpu_environment
+        from ops_utils.hpc.parallel_utils import GPUWorkerPlugin
+        available_gpus = _setup_gpu_environment()
+        n_gpus = len(available_gpus)
+
+        if n_gpus > 0 and _USING_CUPY:
+            # Query per-device VRAM from the first visible GPU
+            per_gpu_mb = xp.cuda.Device(0).mem_info[1]
+            per_gpu_gb = per_gpu_mb / 1e9
+            workers_per_gpu = max(1, int(per_gpu_gb // 18))
+            n_dask_workers = min(workers_per_gpu * n_gpus, len(work_queue))
+            print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each → "
+                  f"{workers_per_gpu}/gpu × {n_gpus} = {n_dask_workers} workers")
+        else:
+            n_dask_workers = min(4, len(work_queue))
+            print(f"[Dask Bands] No GPU detected, using {n_dask_workers} CPU workers")
+
         # threads_per_worker=1: each worker runs one long-lived task (loop
         # over its assigned bands). Write pipelining + prefetch use module-
         # level state that is NOT thread-safe.
         if cuda_path:
             os.environ['CUDA_PATH'] = cuda_path  # workers inherit parent env
+
+        # Clear parent CUDA_VISIBLE_DEVICES so workers don't all bind to the
+        # same device. GPUWorkerPlugin will set it per-worker via round-robin.
+        parent_cuda_devices = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
         # Disable Dask's per-worker memory limit — workers hold ~28-42GB each
         # (current tile_cache + prefetched tile_cache + norm_cpu + prev norm_cpu).
         cluster = LocalCluster(n_workers=n_dask_workers, threads_per_worker=1,
                                memory_limit=0)
         client = Client(cluster)
+
+        # Assign GPUs round-robin: worker 0→GPU0, worker 1→GPU1, ...
+        if n_gpus > 0:
+            client.register_worker_plugin(GPUWorkerPlugin(available_gpus))
+
         cpu_monitor_stop = None
         try:
-            print(f"[Dask Bands] LocalCluster started: {n_dask_workers} workers, 1 thread each")
+            t_phase2_elapsed = time.time() - t_phase2
+            print(f"[Dask Bands] LocalCluster started: {n_dask_workers} workers, 1 thread each ({t_phase2_elapsed:.1f}s)")
 
             # Start CPU/IO monitor (reads /proc for per-worker stats every 5s)
             n_cores = int(os.environ.get("SLURM_CPUS_PER_TASK", 32))
@@ -1613,6 +1688,9 @@ def stitch(
                 cluster.close(timeout=120)
             except Exception:
                 pass
+            # Restore parent CUDA_VISIBLE_DEVICES
+            if parent_cuda_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = parent_cuda_devices
 
         print(f"[Dask Bands] Completed: {len(completed)}/{len(work_queue)} bands")
         if failed:
