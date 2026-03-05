@@ -11,11 +11,6 @@ import scipy
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-if TYPE_CHECKING:
-    from dexp.processing.registration.model.translation_registration_model import (
-        TranslationRegistrationModel,
-    )
-
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
 )

@@ -813,6 +813,13 @@ def assemble_streaming(
     final_shape_xy = get_output_shape(shifts, tile_size)
     final_shape = tcz_target + final_shape_xy
 
+    if any(d == 0 for d in final_shape):
+        raise RuntimeError(
+            f"[assemble_streaming] Computed output shape has zero dimension: {final_shape}. "
+            f"tcz_target={tcz_target}, final_shape_xy={final_shape_xy}, "
+            f"num_tiles={len(shifts)}, tcz_policy='{tcz_policy}'"
+        )
+
     # Adaptive block sizing based on GPU memory
     if use_adaptive_blocks:
         divide_tile_size = _get_optimal_block_size(final_shape, tile_size, divide_tile_size)
