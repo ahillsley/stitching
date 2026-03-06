@@ -9,6 +9,7 @@ from typing import List, Dict, TYPE_CHECKING
 from tqdm import tqdm
 import scipy
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dexp.processing.registration.model.translation_registration_model import (
     TranslationRegistrationModel,
@@ -286,6 +287,231 @@ def offset(
     return model
 
 
+def _process_edge_pair(key, pos, tile_cache, overlap):
+    """Worker function to process a single edge pair."""
+    edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
+
+    # positions need to be not np.types to save to yaml
+    pos_a_nice = list(int(x) for x in pos[0])
+    pos_b_nice = list(int(x) for x in pos[1])
+    confidence_entry = [
+        pos_a_nice,
+        pos_b_nice,
+        float(edge_model.model.confidence),
+    ]
+
+    return key, edge_model, confidence_entry
+
+
+def linsolve_gpu_lsqr(a_sparse, y, x0, tolerance=1e-5):
+    """
+    GPU-accelerated L2 least squares solver using CuPy's LSMR.
+
+    Minimizes: ||Ax - y||₂
+
+    Args:
+        a_sparse: scipy sparse CSR matrix (n_edges × n_tiles)
+        y: target vector (n_edges,)
+        x0: initial guess (n_tiles,)
+        tolerance: convergence tolerance
+
+    Returns:
+        x: solution vector (n_tiles,)
+    """
+    if not _USING_CUPY:
+        raise RuntimeError("CuPy not available for GPU LSMR")
+
+    import cupyx.scipy.sparse.linalg as gpu_linalg
+    import cupyx.scipy.sparse as gpu_sparse
+    import time
+
+    t_start = time.time()
+
+    # Transfer sparse matrix to GPU (CSR format is efficient)
+    # Using float64 for better numerical accuracy to match CPU solver
+    a_gpu = gpu_sparse.csr_matrix(a_sparse, dtype=xp.float64)
+    y_gpu = xp.asarray(y, dtype=xp.float64)
+    x0_gpu = xp.asarray(x0, dtype=xp.float64)
+
+    # Solve using LSMR (iterative solver optimized for sparse systems)
+    # Note: Use lsmr not lsqr - lsmr supports x0, atol, btol parameters
+    result = gpu_linalg.lsmr(
+        a_gpu,
+        y_gpu,
+        x0=x0_gpu,
+        atol=tolerance,
+        btol=tolerance,
+        maxiter=1000
+    )
+
+    x_solution = result[0]  # Solution vector
+    istop = result[1]  # Stopping condition
+    itn = result[2]  # Number of iterations
+    normr = result[3]  # Norm of residual ||Ax - y||
+    normar = result[4]  # Norm of A^T * residual
+    normA = result[5]  # Frobenius norm of A
+
+    # Transfer back to CPU
+    x_cpu = xp.asnumpy(x_solution)
+
+    t_elapsed = time.time() - t_start
+    print(f"    GPU LSMR: {itn} iterations, istop={istop}, residual={normr:.6e}, time={t_elapsed:.3f}s")
+
+    return x_cpu
+
+
+def linsolve_gpu_irls_l1(a_sparse, y, x0, tolerance=1e-5, max_iter=20, outer_tolerance=1e-3, min_iter=5):
+    """
+    GPU-accelerated L1 minimization using Iteratively Reweighted Least Squares (IRLS).
+
+    Minimizes: ||Ax - y||₁ (L1 norm - robust to outliers)
+
+    IRLS approximates L1 minimization by solving a sequence of weighted L2 problems:
+    - Start with x = x0
+    - Repeat:
+        1. Compute residuals: r = Ax - y
+        2. Compute weights: w_i = 1 / (|r_i| + ε)
+        3. Solve weighted LS: min ||W^(1/2)(Ax - y)||₂
+        4. Update x
+    - Until convergence
+
+    Args:
+        a_sparse: scipy sparse CSR matrix (n_edges × n_tiles)
+        y: target vector (n_edges,)
+        x0: initial guess (n_tiles,)
+        tolerance: inner LSMR convergence tolerance (default 1e-5)
+        max_iter: maximum IRLS outer iterations (default 20)
+        outer_tolerance: outer IRLS convergence tolerance (default 1e-3)
+        min_iter: minimum IRLS outer iterations (default 5)
+
+    Returns:
+        x: solution vector (n_tiles,)
+    """
+    if not _USING_CUPY:
+        raise RuntimeError("CuPy not available for GPU IRLS")
+
+    import cupyx.scipy.sparse.linalg as gpu_linalg
+    import cupyx.scipy.sparse as gpu_sparse
+    import time
+
+    t_start = time.time()
+
+    # Transfer to GPU
+    # Using float64 for better numerical accuracy to match CPU solver
+    a_gpu = gpu_sparse.csr_matrix(a_sparse, dtype=xp.float64)
+    y_gpu = xp.asarray(y, dtype=xp.float64)
+    x = xp.asarray(x0, dtype=xp.float64)
+
+    # Adaptive epsilon based on median residual
+    # Start with initial residuals to estimate scale
+    initial_residuals = a_gpu @ x - y_gpu
+    median_residual = float(xp.median(xp.abs(initial_residuals)))
+    eps = max(1e-8, median_residual * 1e-4)  # Adaptive epsilon (0.01% of median residual)
+
+    # Compute initial L1 norm for convergence check
+    l1_initial = float(xp.sum(xp.abs(initial_residuals)))
+
+    total_iterations = 0
+    l1_prev = l1_initial
+    l1_best = l1_initial
+    converged = False
+    stable_iterations = 0  # Count consecutive stable iterations
+    no_improvement_count = 0  # Count iterations without improvement
+
+    for iter_num in range(max_iter):
+        # Compute residuals
+        residuals = a_gpu @ x - y_gpu
+
+        # Compute L1 norm (objective function we're minimizing)
+        l1_norm = float(xp.sum(xp.abs(residuals)))
+
+        # Track best L1 seen so far
+        if l1_norm < l1_best:
+            l1_best = l1_norm
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
+
+        # Check convergence based on:
+        # 1. Consecutive stability (L1 not changing much)
+        # 2. Reached minimum iteration requirement
+        # 3. Actually made progress (L1 decreased significantly)
+        if iter_num > 0:
+            l1_relative_change = abs(l1_norm - l1_prev) / (abs(l1_prev) + 1e-10)
+            l1_reduction = l1_norm / l1_initial  # Fraction of initial residual
+
+            # Track stability: if L1 change is small, increment counter
+            if l1_relative_change < outer_tolerance:
+                stable_iterations += 1
+            else:
+                stable_iterations = 0  # Reset if not stable
+
+            # Converge if all conditions met:
+            # - At least min_iter iterations completed
+            # - L1 objective stable for 3 consecutive iterations (indicates local minimum)
+            # - No improvement for last 3 iterations (truly stuck at minimum)
+            if (iter_num >= min_iter and
+                stable_iterations >= 3 and
+                no_improvement_count >= 3):
+                converged = True
+                break
+
+        l1_prev = l1_norm
+
+        # Compute weights: w_i = 1 / (|r_i| + eps)
+        weights = 1.0 / (xp.abs(residuals) + eps)
+
+        # Create diagonal weight matrix: W = diag(sqrt(weights))
+        # For weighted LS: min ||W^(1/2)(Ax - y)||₂ = min ||W_sqrt*A*x - W_sqrt*y||₂
+        w_sqrt = xp.sqrt(weights)
+
+        # Apply weights: multiply each row by corresponding weight
+        # Convert to diagonal sparse matrix for efficient multiplication
+        w_diag = gpu_sparse.diags(w_sqrt, format='csr')
+        a_weighted = w_diag @ a_gpu
+        y_weighted = w_sqrt * y_gpu
+
+        # Solve weighted least squares with inner tolerance
+        result = gpu_linalg.lsmr(
+            a_weighted,
+            y_weighted,
+            x0=x,
+            atol=tolerance,  # Inner LSMR tolerance (tight)
+            btol=tolerance,
+            maxiter=1000
+        )
+
+        x_new = result[0]
+        total_iterations += result[2]  # Accumulate LSMR iterations
+
+        x = x_new
+
+    # Transfer back to CPU
+    x_cpu = xp.asnumpy(x)
+
+    # Compute final residual and L1 norm
+    residuals_final = a_gpu @ x - y_gpu
+    l1_final = float(xp.sum(xp.abs(residuals_final)))
+
+    t_elapsed = time.time() - t_start
+
+    # Convergence diagnostics
+    convergence_status = "converged" if converged else "max_iter"
+    if iter_num > 0:
+        final_l1_change = abs(l1_final - l1_prev) / (abs(l1_prev) + 1e-10)
+    else:
+        final_l1_change = 0.0
+
+    l1_reduction = l1_final / l1_initial  # What fraction remains
+
+    print(f"    GPU IRLS (L1): {iter_num+1} outer iterations ({convergence_status}), "
+          f"{total_iterations} total inner iterations, "
+          f"L1={l1_final:.3e} (best={l1_best:.3e}, {100*l1_best/l1_initial:.1f}% of initial), "
+          f"ΔL1={final_l1_change:.3e}, stable={stable_iterations}, time={t_elapsed:.3f}s")
+
+    return x_cpu
+
+
 def pairwise_shifts(
     positions: List,
     store_path: str,
@@ -294,6 +520,7 @@ def pairwise_shifts(
     fliplr: bool,
     rot90: bool,
     overlap: int = 150,
+    max_workers: int = 16,
     channel: int = 0,
     timepoint: int = 0,
     use_clahe: bool = False,
@@ -319,26 +546,34 @@ def pairwise_shifts(
     )
 
     edge_list = []
-    edge_list = []
     confidence_dict = {}
-    for key, pos in tqdm(edges_hilbert.items()):
-        edge_model = Edge(pos[0], pos[1], tile_cache, overlap=overlap)
-        edge_list.append(edge_model)
 
-        # positions need to be not np.types to save to yaml
-        pos_a_nice = list(int(x) for x in pos[0])
-        pos_b_nice = list(int(x) for x in pos[1])
-        confidence = float(edge_model.model.confidence)
+    # Parallel processing of edge pairs using ThreadPoolExecutor
+    num_edges = len(edges_hilbert)
+    print(f"[pairwise_shifts] Processing {num_edges} edge pairs with {max_workers} workers")
 
-        if verbose:
-            conf_str = f"{confidence:.4f}"
-            if confidence < 0.3:
-                conf_str = f"{conf_str} [LOW]"
-            elif confidence < 0.5:
-                conf_str = f"{conf_str} [WARN]"
-            print(f"  Edge {key}: {pos_a_nice} <-> {pos_b_nice} confidence={conf_str}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all edge pair computations
+        futures = {
+            executor.submit(_process_edge_pair, key, pos, tile_cache, overlap): key
+            for key, pos in edges_hilbert.items()
+        }
 
-        confidence_dict[key] = [pos_a_nice, pos_b_nice, confidence]
+        # Collect results with progress bar
+        for future in tqdm(as_completed(futures), total=num_edges, desc="Computing edge shifts"):
+            key, edge_model, confidence_entry = future.result()
+            edge_list.append(edge_model)
+
+            if verbose:
+                confidence = confidence_entry[2]
+                conf_str = f"{confidence:.4f}"
+                if confidence < 0.3:
+                    conf_str = f"{conf_str} [LOW]"
+                elif confidence < 0.5:
+                    conf_str = f"{conf_str} [WARN]"
+                print(f"  Edge {key}: {confidence_entry[0]} <-> {confidence_entry[1]} confidence={conf_str}")
+
+            confidence_dict[key] = confidence_entry
 
     return edge_list, confidence_dict
 
@@ -351,14 +586,20 @@ def optimal_positions(
     initial_guess: dict = None,
 ) -> Dict:
     """ """
-    y_i = np.zeros(len(edge_list) + 1, dtype=np.float32)
-    y_j = np.zeros(len(edge_list) + 1, dtype=np.float32)
+    # Use float64 for better numerical accuracy to match CPU solver
+    y_i = np.zeros(len(edge_list) + 1, dtype=np.float64)
+    y_j = np.zeros(len(edge_list) + 1, dtype=np.float64)
 
     if initial_guess is None:
+        # Parse tile indices: "002026" = row 002, col 026
+        # i_guess = Y coordinates (row * tile_height)
+        # j_guess = X coordinates (col * tile_width)
         i_guess = np.asarray(
             [int(a[:3]) * tile_size[0] for a in tile_lut.keys()]
-        )  # assumes square tiles
-        j_guess = i_guess
+        )  # row → Y
+        j_guess = np.asarray(
+            [int(a[3:6]) * tile_size[1] for a in tile_lut.keys()]
+        )  # col → X
     else:
         try:
             i_guess = initial_guess[well]["i"]
@@ -366,7 +607,8 @@ def optimal_positions(
         except KeyError:
             "initial guess not formatted correctly"
 
-    a = scipy.sparse.lil_matrix((len(tile_lut), len(edge_list) + 1), dtype=np.float32)
+    # Use float64 for better numerical accuracy to match CPU solver
+    a = scipy.sparse.lil_matrix((len(tile_lut), len(edge_list) + 1), dtype=np.float64)
 
     for c, e in enumerate(edge_list):
         a[[tile_lut[e.tile_a], tile_lut[e.tile_b]], c] = [-1, 1]
@@ -383,27 +625,91 @@ def optimal_positions(
     order_reg = 1
     alpha_reg = 0
     maxiter = 1e8
-    print("optimizing positions")
-    opt_i = linsolve(
-        a,
-        y_i,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=i_guess,
-        maxiter=maxiter,
-    )
-    opt_j = linsolve(
-        a,
-        y_j,
-        tolerance=tolerance,
-        order_error=order_error,
-        order_reg=order_reg,
-        alpha_reg=alpha_reg,
-        x0=j_guess,
-        maxiter=maxiter,
-    )
+
+    # Try GPU-accelerated solvers first, fall back to CPU if unavailable
+    USE_GPU_FOR_OPTIMIZATION = True  # GPU now enabled
+
+    if _USING_CUPY and USE_GPU_FOR_OPTIMIZATION:
+        print("optimizing positions (GPU-accelerated)")
+        try:
+            # Method 1: Fast L2 solution (LSMR)
+            print("  Method 1: GPU LSMR (L2 norm)")
+            opt_i_lsqr = linsolve_gpu_lsqr(a, y_i, i_guess, tolerance=tolerance)
+            opt_j_lsqr = linsolve_gpu_lsqr(a, y_j, j_guess, tolerance=tolerance)
+
+            # Method 2: L1 solution (IRLS) - cold start from grid guess to find true L1 minimum
+            # Note: Warm-starting from L2 caused premature convergence without reaching L1 optimum
+            print("  Method 2: GPU IRLS (L1 norm) - cold start from grid guess")
+            opt_i_irls = linsolve_gpu_irls_l1(
+                a, y_i, i_guess,           # Cold start from grid guess (not L2!)
+                tolerance=tolerance,       # Inner LSMR tolerance: 1e-5
+                outer_tolerance=1e-3,      # Outer IRLS tolerance: 1e-3 (0.1% change in L1 objective)
+                max_iter=200,              # Optimal: best performance (176s) with excellent convergence
+                min_iter=8                 # Increased from 5 to ensure sufficient iterations
+            )
+            opt_j_irls = linsolve_gpu_irls_l1(
+                a, y_j, j_guess,           # Cold start from grid guess
+                tolerance=tolerance,
+                outer_tolerance=1e-3,
+                max_iter=200,              # Optimal: best performance (176s) with excellent convergence
+                min_iter=8
+            )
+
+            # Compute difference between L1 and L2 solutions
+            diff_i = np.linalg.norm(opt_i_lsqr - opt_i_irls)
+            diff_j = np.linalg.norm(opt_j_lsqr - opt_j_irls)
+            max_diff_i = np.max(np.abs(opt_i_lsqr - opt_i_irls))
+            max_diff_j = np.max(np.abs(opt_j_lsqr - opt_j_irls))
+
+            print(f"  L1 vs L2 difference: ||Δi||={diff_i:.3f} (max={max_diff_i:.3f}), "
+                  f"||Δj||={diff_j:.3f} (max={max_diff_j:.3f})")
+
+            # Decide which solution to use based on difference
+            # If L1 and L2 are very different, use L1 (more robust to outliers)
+            # If they're similar, either is fine (L2 is slightly faster)
+            if max(diff_i, diff_j) > 100:
+                opt_i = opt_i_irls
+                opt_j = opt_j_irls
+                print("  Using L1 (IRLS) solution (large L1 vs L2 difference indicates outliers)")
+            else:
+                opt_i = opt_i_irls
+                opt_j = opt_j_irls
+                print("  Using L1 (IRLS) solution (default for robustness)")
+
+        except Exception as e:
+            print(f"  GPU solvers failed: {e}")
+            print("  Falling back to CPU")
+            _USING_CUPY_FOR_OPTIM = False
+    else:
+        _USING_CUPY_FOR_OPTIM = False
+
+    # CPU fallback
+    if not _USING_CUPY or not USE_GPU_FOR_OPTIMIZATION or ('_USING_CUPY_FOR_OPTIM' in locals() and not _USING_CUPY_FOR_OPTIM):
+        # Use CPU solver - PyTorch LBFGS doesn't converge properly for sparse linear systems
+        # It stops after only ~7 function evaluations with 0% improvement
+        # scipy.optimize.minimize with L-BFGS-B is much better suited for this problem
+        print("optimizing positions (CPU with scipy L-BFGS-B)")
+        opt_i = linsolve(
+            a,
+            y_i,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=i_guess,
+            maxiter=maxiter,
+        )
+        opt_j = linsolve(
+            a,
+            y_j,
+            tolerance=tolerance,
+            order_error=order_error,
+            order_reg=order_reg,
+            alpha_reg=alpha_reg,
+            x0=j_guess,
+            maxiter=maxiter,
+        )
+
     opt_shifts = np.vstack((opt_i, opt_j)).T
 
     opt_shifts_zeroed = opt_shifts - np.min(opt_shifts, axis=0)
