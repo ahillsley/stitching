@@ -18,7 +18,7 @@ dependencies = [
     "zarr",
     "tqdm",
     "pyyaml",
-    "iohub==0.3.0a6",
+    "iohub>=0.3.0a7",
     "scikit-image",  # for CLAHE preprocessing
     "dexp",  # for registration
     "joblib",
@@ -30,5 +30,8 @@ gpu = [
 ]
 
 # Hatch config
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["stitch"]
