@@ -1223,129 +1223,149 @@ def _stitch_bands_loop_worker(
 
     for i, (well_id, band_idx, y0, y1, y_tiles, final_shape, is_last) in enumerate(band_list):
         gpu_timings = None
-        try:
-            t_start = time.time()
-            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
-            print(
-                f"[{ts}] [Band Worker] Starting well={well_id} band={band_idx+1} "
-                f"y=[{y0}:{y1}] tiles={len(y_tiles)} (PID={os.getpid()})"
-            )
-
-            arr_out = zarr.open(
-                os.path.join(output_store_path, "A", well_id, "0", "0"),
-                mode="r+",
-            )
-
-            # ---- Load tiles: from prefetch or blocking load ----
-            t_load = time.time()
-            if prefetch_future is not None:
-                tile_cache = prefetch_future.result()
-                t_load_elapsed = time.time() - t_load
-                load_src = "prefetch"
-            else:
-                tile_cache = _load_band_tiles(
-                    y_tiles, fov_store_p, flipud, fliplr, rot90
-                )
-                t_load_elapsed = time.time() - t_load
-                load_src = "cold"
-
-            # ---- Start prefetching next band BEFORE GPU work ----
-            # GPU releases GIL → prefetch threads get uncontested GIL access
-            prefetch_future = None
-            if i + 1 < len(band_list):
-                next_y_tiles = band_list[i + 1][4]  # y_tiles field
-                prefetch_future = prefetch_pool.submit(
-                    _load_band_tiles,
-                    next_y_tiles, fov_store_p, flipud, fliplr, rot90,
+        for attempt in range(2):
+            try:
+                t_start = time.time()
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
+                retry_tag = f" [retry {attempt}]" if attempt > 0 else ""
+                print(
+                    f"[{ts}] [Band Worker]{retry_tag} Starting well={well_id} band={band_idx+1} "
+                    f"y=[{y0}:{y1}] tiles={len(y_tiles)} (PID={os.getpid()})"
                 )
 
-            # ---- GPU process this Y-band ----
-            t_gpu = time.time()
-            total_x = final_shape[-1]
-            gpu_result = _process_y_band_gpu(
-                y0, y1, total_x, y_tiles, tile_cache, final_shape,
-                dtype_val, use_edt, tile_weights, return_gpu=True,
-                profile=profile,
-            )
-            if profile:
-                norm_gpu, gpu_timings = gpu_result
-            else:
-                norm_gpu = gpu_result
-            t_gpu_elapsed = time.time() - t_gpu
+                arr_out = zarr.open(
+                    os.path.join(output_store_path, "A", well_id, "0", "0"),
+                    mode="r+",
+                )
 
-            # ---- D2H transfer ----
-            t_d2h = time.time()
-            norm_cpu = norm_gpu.get()
-            del norm_gpu, tile_cache
-            xp.get_default_memory_pool().free_all_blocks()
-            t_d2h_elapsed = time.time() - t_d2h
+                # ---- Load tiles: from prefetch or blocking load ----
+                # On retry prefetch_future has been cancelled, always cold-load.
+                t_load = time.time()
+                if prefetch_future is not None:
+                    tile_cache = prefetch_future.result()
+                    t_load_elapsed = time.time() - t_load
+                    load_src = "prefetch"
+                else:
+                    tile_cache = _load_band_tiles(
+                        y_tiles, fov_store_p, flipud, fliplr, rot90
+                    )
+                    t_load_elapsed = time.time() - t_load
+                    load_src = "cold"
 
-            # ---- Wait for previous band's writes ----
-            t_wait = time.time()
-            _wait_band_writes()
-            t_wait_elapsed = time.time() - t_wait
+                # ---- Start prefetching next band BEFORE GPU work ----
+                # GPU releases GIL → prefetch threads get uncontested GIL access
+                prefetch_future = None
+                if i + 1 < len(band_list):
+                    next_y_tiles = band_list[i + 1][4]  # y_tiles field
+                    prefetch_future = prefetch_pool.submit(
+                        _load_band_tiles,
+                        next_y_tiles, fov_store_p, flipud, fliplr, rot90,
+                    )
 
-            # One-time blosc benchmark
-            _run_blosc_benchmark(
-                np.ascontiguousarray(norm_cpu[0, 0, 0, :, :tx])
-            )
+                # ---- GPU process this Y-band ----
+                t_gpu = time.time()
+                total_x = final_shape[-1]
+                gpu_result = _process_y_band_gpu(
+                    y0, y1, total_x, y_tiles, tile_cache, final_shape,
+                    dtype_val, use_edt, tile_weights, return_gpu=True,
+                    profile=profile,
+                )
+                if profile:
+                    norm_gpu, gpu_timings = gpu_result
+                else:
+                    norm_gpu = gpu_result
+                t_gpu_elapsed = time.time() - t_gpu
 
-            # ---- Submit writes to persistent pool (non-blocking) ----
-            global _band_write_submit_time
-            _band_write_submit_time = time.time()
-            pool = _init_band_write_pool()
-            n_blocks = 0
-            for x0 in range(0, total_x, tx):
-                x1 = min(total_x, x0 + tx)
-                _band_pending_futures.append(pool.submit(
-                    _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1,
-                    norm_cpu[:, :, :, :, x0:x1],
-                ))
-                n_blocks += 1
-            _band_pending_data.append(norm_cpu)
-            print(
-                f"[Band Worker] Submitted {n_blocks} write blocks, "
-                f"{norm_cpu.nbytes/1e9:.2f}GB ({norm_cpu.dtype})"
-            )
+                # ---- D2H transfer ----
+                t_d2h = time.time()
+                norm_cpu = norm_gpu.get()
+                del norm_gpu, tile_cache
+                xp.get_default_memory_pool().free_all_blocks()
+                t_d2h_elapsed = time.time() - t_d2h
 
-            # Flush on last band of a well
-            if is_last:
-                t_flush = time.time()
+                # ---- Wait for previous band's writes ----
+                t_wait = time.time()
                 _wait_band_writes()
-                t_flush_elapsed = time.time() - t_flush
-                print(
-                    f"[Band Worker] Final flush well={well_id}: "
-                    f"{t_flush_elapsed:.1f}s"
+                t_wait_elapsed = time.time() - t_wait
+
+                # One-time blosc benchmark
+                _run_blosc_benchmark(
+                    np.ascontiguousarray(norm_cpu[0, 0, 0, :, :tx])
                 )
 
-            t_total = time.time() - t_start
-            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
-            print(
-                f"[{ts}] [Band Worker] Done well={well_id} band={band_idx+1} "
-                f"load={t_load_elapsed:.1f}s({load_src}) "
-                f"gpu={t_gpu_elapsed:.1f}s d2h={t_d2h_elapsed:.1f}s "
-                f"wait_prev={t_wait_elapsed:.1f}s total={t_total:.1f}s"
-            )
-            if profile and gpu_timings:
-                gt = gpu_timings
+                # ---- Submit writes to persistent pool (non-blocking) ----
+                global _band_write_submit_time
+                _band_write_submit_time = time.time()
+                pool = _init_band_write_pool()
+                n_blocks = 0
+                for x0 in range(0, total_x, tx):
+                    x1 = min(total_x, x0 + tx)
+                    _band_pending_futures.append(pool.submit(
+                        _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1,
+                        norm_cpu[:, :, :, :, x0:x1],
+                    ))
+                    n_blocks += 1
+                _band_pending_data.append(norm_cpu)
                 print(
-                    f"  [GPU detail] alloc={gt.get('alloc',0):.2f}s "
-                    f"accum={gt.get('accum',0):.2f}s "
-                    f"({gt.get('n_tiles_hit',0)} tiles: "
-                    f"slice_cpu={gt.get('slice_cpu',0):.2f}s "
-                    f"h2d={gt.get('h2d',0):.2f}s "
-                    f"gpu_kernel={gt.get('gpu_kernel',0):.2f}s) "
-                    f"norm={gt.get('normalize',0):.2f}s "
-                    f"gpu_mem: alloc={gt.get('alloc_gpu_mb',0):.0f}MB "
-                    f"post_norm={gt.get('post_norm_gpu_mb',0):.0f}MB"
+                    f"[Band Worker] Submitted {n_blocks} write blocks, "
+                    f"{norm_cpu.nbytes/1e9:.2f}GB ({norm_cpu.dtype})"
                 )
-            results.append((well_id, band_idx, True))
 
-        except Exception as e:
-            import traceback
-            print(f"[Band Worker] Failed well={well_id} band={band_idx+1}: {e}")
-            traceback.print_exc()
-            results.append((well_id, band_idx, False))
+                # Flush on last band of a well
+                if is_last:
+                    t_flush = time.time()
+                    _wait_band_writes()
+                    t_flush_elapsed = time.time() - t_flush
+                    print(
+                        f"[Band Worker] Final flush well={well_id}: "
+                        f"{t_flush_elapsed:.1f}s"
+                    )
+
+                t_total = time.time() - t_start
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
+                print(
+                    f"[{ts}] [Band Worker] Done well={well_id} band={band_idx+1} "
+                    f"load={t_load_elapsed:.1f}s({load_src}) "
+                    f"gpu={t_gpu_elapsed:.1f}s d2h={t_d2h_elapsed:.1f}s "
+                    f"wait_prev={t_wait_elapsed:.1f}s total={t_total:.1f}s"
+                )
+                if profile and gpu_timings:
+                    gt = gpu_timings
+                    print(
+                        f"  [GPU detail] alloc={gt.get('alloc',0):.2f}s "
+                        f"accum={gt.get('accum',0):.2f}s "
+                        f"({gt.get('n_tiles_hit',0)} tiles: "
+                        f"slice_cpu={gt.get('slice_cpu',0):.2f}s "
+                        f"h2d={gt.get('h2d',0):.2f}s "
+                        f"gpu_kernel={gt.get('gpu_kernel',0):.2f}s) "
+                        f"norm={gt.get('normalize',0):.2f}s "
+                        f"gpu_mem: alloc={gt.get('alloc_gpu_mb',0):.0f}MB "
+                        f"post_norm={gt.get('post_norm_gpu_mb',0):.0f}MB"
+                    )
+                results.append((well_id, band_idx, True))
+                break  # success — no retry needed
+
+            except Exception as e:
+                import traceback
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:12]
+                print(
+                    f"[{ts}] [Band Worker] Failed (attempt {attempt + 1}/2) "
+                    f"well={well_id} band={band_idx+1}: {e}"
+                )
+                traceback.print_exc()
+                # Cancel any prefetch that was started for the next band so the
+                # retry does a fresh cold load instead of a potentially stale one.
+                if prefetch_future is not None:
+                    prefetch_future.cancel()
+                    prefetch_future = None
+                # Flush GPU memory pools to recover from OOM before retrying.
+                try:
+                    xp.get_default_memory_pool().free_all_blocks()
+                    xp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                if attempt == 1:
+                    results.append((well_id, band_idx, False))
 
     # Final flush: ensure all pending writes complete before returning
     _wait_band_writes()
