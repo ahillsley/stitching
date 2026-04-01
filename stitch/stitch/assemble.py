@@ -1497,8 +1497,10 @@ def stitch(
         print(f"[Dask Bands] Wells: {well_ids}")
 
         # Resolve divide_tile_size for Y-band computation and write chunking
+        # Band size and output chunks MUST match to avoid concurrent writes to the same chunk
         divide_tile_yx = kwargs.get("target_chunks_yx", (2048, 2048))
         ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
+        chunks_size = (1, 1, 1, ty_band, tx_write)
         blending_exponent = kwargs.get("blending_exponent", 1.0)
         value_precision_bits = kwargs.get("value_precision_bits", 32)
         dtype_val = _resolve_value_dtype(value_precision_bits)
