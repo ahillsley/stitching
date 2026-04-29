@@ -1609,8 +1609,12 @@ def stitch(
         t_phase2 = time.time()
 
         # Detect available GPUs and scale workers across all devices.
-        # Peak ~15GB GPU per worker (numer+denom+tile temps in float16).
-        # Use 18GB divisor per device: A100-80GB→4/gpu, H200-141GB→7/gpu, A40-48GB→2/gpu.
+        # Peak GPU per worker depends on band size: numer + denom + norm temp
+        # + block + working ≈ 4 × (T*C*Z × ty_band × total_x × itemsize). For
+        # track/pheno T*C*Z ~5-10 → ~10-15 GB; for ISS T*C*Z ~50-70 → ~20-25 GB.
+        # We compute peak from the actual work queue (max final_shape across
+        # wells) so packing is correct for the real dataset rather than a
+        # hardcoded 18 GB divisor.
         from ops_utils.hpc.gpu_utils import _setup_gpu_environment
         from ops_utils.hpc.parallel_utils import MultiGPUCluster
         available_gpus = _setup_gpu_environment()
@@ -1620,9 +1624,27 @@ def stitch(
             # Query per-device VRAM from the first visible GPU
             per_gpu_mb = xp.cuda.Device(0).mem_info[1]
             per_gpu_gb = per_gpu_mb / 1e9
-            workers_per_gpu = max(1, int(per_gpu_gb // 18))
+
+            # Peak band size across the whole work_queue: each item carries
+            # final_shape; band height is at most ty_band; band width is the
+            # full stitched x extent (final_shape[-1]).
+            itemsize = int(np.dtype(dtype_val).itemsize)
+            peak_band_bytes = 0
+            for _wid, _bidx, _y0, _y1, _yts, _fshape, _is_last in work_queue:
+                t_c_z = int(_fshape[0]) * int(_fshape[1]) * int(_fshape[2])
+                band_h = int(min(ty_band, _fshape[-2] - _y0))
+                band_w = int(_fshape[-1])
+                array_bytes = t_c_z * band_h * band_w * itemsize
+                if array_bytes > peak_band_bytes:
+                    peak_band_bytes = array_bytes
+            # Per-worker peak: numer + denom + norm + block/working ≈ 4×.
+            # Add 4 GB headroom for cuda context, cupy memory-pool overhead,
+            # and the prefetched-tile cache.
+            peak_gb_per_worker = (4 * peak_band_bytes) / 1e9 + 4.0
+            workers_per_gpu = max(1, int(per_gpu_gb // peak_gb_per_worker))
             n_dask_workers = min(workers_per_gpu * n_gpus, len(work_queue))
-            print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each → "
+            print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each, "
+                  f"peak~{peak_gb_per_worker:.1f}GB/worker → "
                   f"{workers_per_gpu}/gpu × {n_gpus} = {n_dask_workers} workers")
         else:
             workers_per_gpu = min(4, len(work_queue))
