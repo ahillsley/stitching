@@ -1735,13 +1735,33 @@ def stitch(
         print(f"[Dask Bands] Wells: {well_ids}")
 
         # Resolve divide_tile_size for Y-band computation and write chunking
-        # Band size and output chunks MUST match to avoid concurrent writes to the same chunk
+        # Band size and output chunks MUST match to avoid concurrent writes to the same chunk.
+        #
+        # Three env knobs to tune metadata vs storage layout:
+        #   STITCH_TILE_YX=4096      — bumps Y/X chunk and band size (default 2048).
+        #   STITCH_CHUNK_TC=1        — collapse leading T,C dims into ONE chunk
+        #                              (default 0 = chunk=(1,1,1,...)). For ISS
+        #                              this drops file count 50× (per (T,C,Z) the
+        #                              chunk now holds all 50 leading positions).
+        #   STITCH_SHARD_RATIO_YX=N  — zarr v3 sharding with N×N chunks per shard
+        #                              (default 0 = stay v2, no shards).
         divide_tile_yx = kwargs.get("target_chunks_yx", (2048, 2048))
-        ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
-        chunks_size = (1, 1, 1, ty_band, tx_write)
+        tile_yx_env = int(os.environ.get("STITCH_TILE_YX", "0") or "0")
+        if tile_yx_env > 0:
+            ty_band = tx_write = tile_yx_env
+        else:
+            ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
+
+        chunk_tc = int(os.environ.get("STITCH_CHUNK_TC", "0") or "0") == 1
+        shard_ratio_yx = int(os.environ.get("STITCH_SHARD_RATIO_YX", "0") or "0")
+        use_v3_shards = shard_ratio_yx > 0
+
+        # chunks_size will be finalised per-well (needs T,C,Z from final_shape).
         blending_exponent = kwargs.get("blending_exponent", 1.0)
         value_precision_bits = kwargs.get("value_precision_bits", 32)
         dtype_val = _resolve_value_dtype(value_precision_bits)
+        print(f"[Dask Bands] chunks layout: tile_yx={ty_band} chunk_tc={chunk_tc} "
+              f"shard_ratio_yx={shard_ratio_yx} v3={use_v3_shards}")
 
         # Phase 1: Pre-create wells, compute Y-bands, build interleaved work queue
         work_queue = []
@@ -1758,27 +1778,55 @@ def stitch(
             first_tile_shape = tuple(meta["shape"])
             final_shape = first_tile_shape[:3] + final_shape_xy
 
-            # Create output position + zeros via iohub
-            stitched_pos = output_store.create_position("A", well_id, "0")
-            stitched_pos.create_zeros(
-                "0",
-                shape=final_shape,
-                chunks=chunks_size,
-                dtype=dtype_val,
-                transform=(
-                    [TransformationMeta(type="scale", scale=scale)]
-                    if scale is not None
-                    else None
-                ),
-            )
+            # Resolve per-well chunk geometry. With chunk_tc=True, collapse
+            # T,C into a single chunk so each (Y, X) block on disk holds the
+            # full leading-dim stack (one file per spatial chunk instead of
+            # T*C files).
+            tc_chunk = (final_shape[0], final_shape[1]) if chunk_tc else (1, 1)
+            chunks_size = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
 
-            # Override compressor: lz4 is 3x faster than zstd on dense
-            # float16 image data (5ms vs 16ms per 8MB chunk) with the same
-            # compression ratio (~2.1x). iohub hardcodes zstd; patch .zarray.
+            stitched_pos = output_store.create_position("A", well_id, "0")
+            if use_v3_shards:
+                # iohub.create_zeros() doesn't accept shards; drop down to the
+                # underlying zarr group and use create_array directly. This
+                # bypasses iohub's NGFF metadata helpers — we add a minimal
+                # multiscale entry afterwards if scale was requested.
+                inner_yx = max(1, ty_band // shard_ratio_yx)
+                v3_chunks = (1, 1, 1, inner_yx, inner_yx)
+                v3_shards = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
+                pos_grp = stitched_pos.zgroup  # underlying zarr group
+                pos_grp.create_array(
+                    "0",
+                    shape=final_shape,
+                    dtype=dtype_val,
+                    chunks=v3_chunks,
+                    shards=v3_shards,
+                    fill_value=0,
+                )
+                if well_id == well_ids[0]:
+                    print(f"[Dask Bands] zarr v3 layout: chunks={v3_chunks} "
+                          f"shards={v3_shards}")
+            else:
+                stitched_pos.create_zeros(
+                    "0",
+                    shape=final_shape,
+                    chunks=chunks_size,
+                    dtype=dtype_val,
+                    transform=(
+                        [TransformationMeta(type="scale", scale=scale)]
+                        if scale is not None
+                        else None
+                    ),
+                )
+
+            # Override compressor (zarr v2 path only): lz4 is 3x faster than
+            # zstd on dense float16 image data (5ms vs 16ms per 8MB chunk)
+            # with the same compression ratio (~2.1x). iohub hardcodes zstd;
+            # patch .zarray. Zarr v3 has its own codec block — leave it.
             zarray_path = (
                 Path(output_store_path) / "A" / well_id / "0" / "0" / ".zarray"
             )
-            if zarray_path.exists():
+            if not use_v3_shards and zarray_path.exists():
                 with open(zarray_path) as f:
                     zmeta = json.load(f)
                 old_cname = zmeta.get("compressor", {}).get("cname", "?")
@@ -1888,6 +1936,19 @@ def stitch(
             # and the prefetched-tile cache.
             peak_gb_per_worker = (4 * peak_band_bytes) / 1e9 + 4.0
             workers_per_gpu = max(1, int(per_gpu_gb // peak_gb_per_worker))
+            # STITCH_WORKERS_PER_GPU overrides the auto-derived count — useful
+            # when you want a small number of workers fed by deep read prefetch
+            # / large write window (saturating GPU with less host-RAM
+            # contention than packing more workers).
+            override = os.environ.get("STITCH_WORKERS_PER_GPU", "")
+            try:
+                override_n = int(override) if override else 0
+            except ValueError:
+                override_n = 0
+            if override_n > 0:
+                print(f"[Dask Bands] STITCH_WORKERS_PER_GPU override: "
+                      f"{workers_per_gpu} → {override_n}")
+                workers_per_gpu = override_n
             n_dask_workers = min(workers_per_gpu * n_gpus, len(work_queue))
             print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each, "
                   f"peak~{peak_gb_per_worker:.1f}GB/worker → "
