@@ -694,11 +694,13 @@ def assemble_streaming(
     if profile:
         print(f"[assemble.streaming] PROFILING ENABLED (GPU syncs will slow overall runtime)")
 
-    # Read tile shapes directly from .zarray JSON files (avoids opening full HCS store).
+    # Read tile shapes directly from array JSON files (avoids opening full HCS store).
     fov_store_p = Path(fov_store_path)
     tile_shapes = {}
     for tname in shifts.keys():
-        with open(fov_store_p / tname / "0" / ".zarray") as f:
+        arr_dir = fov_store_p / tname / "0"
+        arr_meta_path = arr_dir / "zarr.json" if (arr_dir / "zarr.json").exists() else arr_dir / ".zarray"
+        with open(arr_meta_path) as f:
             meta = json.load(f)
         tile_shapes[tname] = tuple(meta["shape"])
 
@@ -1399,15 +1401,31 @@ def stitch(
     # takes minutes; reading one position's JSON files is instant.
     input_store_p = Path(input_store_path)
     first_pos_key = next(iter(all_shifts.keys()))  # e.g. "A/1/002026"
-    with open(input_store_p / first_pos_key / ".zattrs") as f:
-        pos_attrs = json.load(f)
-    channel_names = [c["label"] for c in pos_attrs["omero"]["channels"]]
-    scale_transforms = pos_attrs.get("multiscales", [{}])[0].get("datasets", [{}])[0].get("coordinateTransformations", [])
+    ngff_version = kwargs.get("ngff_version", "0.4")
+    if ngff_version == "0.5":
+        with open(input_store_p / first_pos_key / "zarr.json") as f:
+            raw = json.load(f)
+        pos_attrs = raw.get("attributes", raw)
+    else:
+        with open(input_store_p / first_pos_key / ".zattrs") as f:
+            pos_attrs = json.load(f)
+    if ngff_version == "0.5":
+        channel_names = [c["label"] for c in pos_attrs["ome"]["omero"]["channels"]]
+        scale_transforms = pos_attrs.get("ome", {}).get("multiscales", [{}])[0].get("datasets", [{}])[0].get("coordinateTransformations", [])
+    else:
+        channel_names = [c["label"] for c in pos_attrs["omero"]["channels"]]
+        scale_transforms = pos_attrs.get("multiscales", [{}])[0].get("datasets", [{}])[0].get("coordinateTransformations", [])
     scale = tuple(scale_transforms[0]["scale"]) if scale_transforms and scale_transforms[0].get("type") == "scale" else None
-    with open(input_store_p / first_pos_key / "0" / ".zarray") as f:
-        arr_meta = json.load(f)
-    tile_shape = tuple(arr_meta["shape"])
-    chunks_size = tuple(arr_meta["chunks"])
+    if ngff_version == "0.5":
+        with open(input_store_p / first_pos_key / "0" / "zarr.json") as f:
+            arr_meta = json.load(f)
+        tile_shape = tuple(arr_meta["shape"])
+        chunks_size = tuple(arr_meta["chunk_grid"]["configuration"]["chunk_shape"])
+    else:
+        with open(input_store_p / first_pos_key / "0" / ".zarray") as f:
+            arr_meta = json.load(f)
+        tile_shape = tuple(arr_meta["shape"])
+        chunks_size = tuple(arr_meta["chunks"])
     # Optional override for output chunking to improve viewer (dask/napari) responsiveness
     # Accept either full 5D "target_chunks" or YX-only via "target_chunks_yx"
     target_chunks = kwargs.get("target_chunks")
@@ -1493,8 +1511,12 @@ def stitch(
 
             # Determine T,C,Z from tile metadata
             first_tile_key = next(iter(well_shifts.keys()))
-            with open(fov_store_p / first_tile_key / "0" / ".zarray") as f:
-                meta = json.load(f)
+            if ngff_version == "0.5":
+                with open(fov_store_p / first_tile_key / "0" / "zarr.json") as f:
+                    meta = json.load(f)
+            else:
+                with open(fov_store_p / first_tile_key / "0" / ".zarray") as f:
+                    meta = json.load(f)
             first_tile_shape = tuple(meta["shape"])
             final_shape = first_tile_shape[:3] + final_shape_xy
 
@@ -1538,8 +1560,12 @@ def stitch(
             dtype_idx = _resolve_shift_dtype(well_shifts, tile_shape[-2:], base_bits=32)
             tile_shapes = {}
             for tname in well_shifts.keys():
-                with open(fov_store_p / tname / "0" / ".zarray") as f:
-                    tmeta = json.load(f)
+                if ngff_version == "0.5":
+                    with open(fov_store_p / tname / "0" / "zarr.json") as f:
+                        tmeta = json.load(f)
+                else:
+                    with open(fov_store_p / tname / "0" / ".zarray") as f:
+                        tmeta = json.load(f)
                 tile_shapes[tname] = tuple(tmeta["shape"])
 
             tile_meta = []
