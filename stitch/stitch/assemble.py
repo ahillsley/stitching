@@ -1379,11 +1379,25 @@ def _stitch_band_dask_worker(well_id, band_idx, y0, y1, y_tiles,
 _prefetch_executor = None
 
 
+def _read_depth() -> int:
+    """STITCH_READ_DEPTH bounds how many bands' tile loads run concurrently
+    with GPU compute. depth=1 reproduces the legacy single-prefetch
+    behaviour (one band ahead). depth>1 keeps multiple band-loads in
+    flight, paying off only when NFS read bandwidth has slack."""
+    try:
+        return max(1, int(os.environ.get("STITCH_READ_DEPTH", "1") or "1"))
+    except ValueError:
+        return 1
+
+
 def _init_prefetch_executor():
     global _prefetch_executor
     if _prefetch_executor is None:
+        # Pool size matches read depth — each prefetch task runs a
+        # joblib-or-thread-pool _load_band_tiles internally, so a single
+        # thread is enough to dispatch and wait on it.
         _prefetch_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="prefetch"
+            max_workers=max(1, _read_depth()), thread_name_prefix="prefetch"
         )
     return _prefetch_executor
 
@@ -1419,8 +1433,19 @@ def _stitch_bands_loop_worker(
     )
 
     prefetch_pool = _init_prefetch_executor()
-    prefetch_future = None
+    read_depth = _read_depth()
+    # Deque of in-flight prefetches: each entry is (target_band_index, future).
+    # FIFO — index 0 is the next band's load.
+    prefetch_queue: "deque" = deque()
     results = []
+
+    # Prime the queue by submitting the first `read_depth` bands ahead.
+    # Band 0 is loaded fresh below (cold path), so prime starts at band 1.
+    for ahead in range(1, min(read_depth, len(band_list))):
+        ahead_y_tiles = band_list[ahead][4]
+        prefetch_queue.append((ahead, prefetch_pool.submit(
+            _load_band_tiles, ahead_y_tiles, fov_store_p, flipud, fliplr, rot90,
+        )))
 
     for i, (well_id, band_idx, y0, y1, y_tiles, final_shape, is_last) in enumerate(band_list):
         gpu_timings = None
@@ -1439,29 +1464,39 @@ def _stitch_bands_loop_worker(
                     mode="r+",
                 )
 
-                # ---- Load tiles: from prefetch or blocking load ----
-                # On retry prefetch_future has been cancelled, always cold-load.
+                # ---- Load tiles: pop matching prefetch or blocking load ----
+                # On retry the prefetch for THIS band may have been cancelled;
+                # fall back to a cold load. The deque can also hold prefetches
+                # for bands i+1 ... i+depth-1 — leave those alone.
                 t_load = time.time()
-                if prefetch_future is not None:
-                    tile_cache = prefetch_future.result()
+                tile_cache = None
+                if prefetch_queue and prefetch_queue[0][0] == i:
+                    _, fut = prefetch_queue.popleft()
+                    tile_cache = fut.result()
                     t_load_elapsed = time.time() - t_load
                     load_src = "prefetch"
                 else:
                     tile_cache = _load_band_tiles(
-                        y_tiles, fov_store_p, flipud, fliplr, rot90
+                        y_tiles, fov_store_p, flipud, fliplr, rot90,
                     )
                     t_load_elapsed = time.time() - t_load
                     load_src = "cold"
 
-                # ---- Start prefetching next band BEFORE GPU work ----
-                # GPU releases GIL → prefetch threads get uncontested GIL access
-                prefetch_future = None
-                if i + 1 < len(band_list):
-                    next_y_tiles = band_list[i + 1][4]  # y_tiles field
-                    prefetch_future = prefetch_pool.submit(
-                        _load_band_tiles,
-                        next_y_tiles, fov_store_p, flipud, fliplr, rot90,
-                    )
+                # ---- Top up the prefetch queue ----
+                # After consuming i, queue's frontmost prefetch is for i+1
+                # (if any). Submit a new prefetch for i+read_depth so the
+                # queue stays read_depth-1 ahead of the consumer (since the
+                # current band's tile_cache is also held alive).
+                next_to_submit = i + read_depth
+                if next_to_submit < len(band_list):
+                    nts_y_tiles = band_list[next_to_submit][4]
+                    prefetch_queue.append((
+                        next_to_submit,
+                        prefetch_pool.submit(
+                            _load_band_tiles,
+                            nts_y_tiles, fov_store_p, flipud, fliplr, rot90,
+                        ),
+                    ))
 
                 # ---- GPU process this Y-band ----
                 t_gpu = time.time()
@@ -1556,11 +1591,11 @@ def _stitch_bands_loop_worker(
                     f"well={well_id} band={band_idx+1}: {e}"
                 )
                 traceback.print_exc()
-                # Cancel any prefetch that was started for the next band so the
-                # retry does a fresh cold load instead of a potentially stale one.
-                if prefetch_future is not None:
-                    prefetch_future.cancel()
-                    prefetch_future = None
+                # Note: with STITCH_READ_DEPTH>=1 the prefetch queue holds
+                # futures for FUTURE bands (i+1 ... i+depth), not the
+                # currently-failing band. Leave them in flight — they're
+                # still useful for the next iteration. The retry path
+                # cold-loads its own tiles via the `else` branch above.
                 # Flush GPU memory pools to recover from OOM before retrying.
                 try:
                     xp.get_default_memory_pool().free_all_blocks()
