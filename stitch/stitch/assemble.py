@@ -48,10 +48,15 @@ from stitch.stitch.utils import (
 # ── Module-level per-process write pipeline ──────────────────────────────────
 # These persist across Dask tasks within the same worker process, enabling
 # write pipelining: band N's writes run in background while band N+1 loads+GPU.
+#
+# STITCH_WRITE_WINDOW (default 1) bounds how many bands' writes may be in
+# flight per worker. window=1 reproduces the legacy behaviour (drain prior
+# before submitting next). window=2+ lets the worker submit and move on,
+# only draining when the window fills — burying NFS write latency under
+# the next band's compute. Memory cost: each in-flight band holds its
+# numpy buffer (~5.6 GB for ISS) until writes complete.
 _band_write_pool = None
-_band_pending_futures = []
-_band_pending_data = []  # prevent GC of numpy arrays being written
-_band_write_submit_time = None  # wall-clock start of write submission
+_band_window: "deque" = deque()  # FIFO of per-band write slots
 _blosc_benchmark_done = False
 
 
@@ -67,18 +72,18 @@ def _init_band_write_pool(max_workers=8):
     return _band_write_pool
 
 
-def _wait_band_writes():
-    """Wait for all pending writes from the previous band, collect stats, free buffers."""
-    global _band_pending_futures, _band_pending_data, _band_write_submit_time
-    if not _band_pending_futures:
+def _drain_band_slot(slot):
+    """Wait for one band's writes; print stats; release buffers."""
+    futures = slot["futures"]
+    if not futures:
         return
     total_bytes = 0
     block_times = []
-    for fut in _band_pending_futures:
+    for fut in futures:
         data_bytes, elapsed = fut.result()
         total_bytes += data_bytes
         block_times.append(elapsed)
-    wall_time = time.time() - _band_write_submit_time if _band_write_submit_time else 0
+    wall_time = time.time() - slot["submit_time"]
     n = len(block_times)
     avg_t = sum(block_times) / n if n else 0
     max_t = max(block_times) if block_times else 0
@@ -87,9 +92,58 @@ def _wait_band_writes():
     print(f"[Write Stats] {n} blocks, {total_bytes/1e9:.2f}GB, "
           f"wall={wall_time:.1f}s ({throughput:.0f}MB/s), "
           f"per_block: min={min_t:.1f}s avg={avg_t:.1f}s max={max_t:.1f}s")
-    _band_pending_futures.clear()
-    _band_pending_data.clear()
-    _band_write_submit_time = None
+    slot["futures"].clear()
+    slot["data"].clear()
+
+
+def _maybe_drain_oldest():
+    """Drain the oldest band slot if the window is at capacity. Returns the
+    wait time. Call BEFORE submitting a new band's writes so the thread
+    pool queue ordering matches the legacy `drain-then-submit` semantics
+    when STITCH_WRITE_WINDOW=1.
+    """
+    global _band_window
+    max_window = max(1, int(os.environ.get("STITCH_WRITE_WINDOW", "1") or "1"))
+    if len(_band_window) < max_window:
+        return 0.0
+    t0 = time.time()
+    _drain_band_slot(_band_window.popleft())
+    return time.time() - t0
+
+
+def _record_band_writes(futures, data_refs):
+    """Append a band slot to the window. Caller must have already called
+    _maybe_drain_oldest() to make room.
+    """
+    global _band_window
+    _band_window.append({
+        "futures": list(futures),
+        "data": list(data_refs),  # hold numpy refs until writes complete
+        "submit_time": time.time(),
+    })
+
+
+def _push_band_writes(futures, data_refs):
+    """Convenience: drain-if-full → record. Equivalent to the legacy
+    drain-then-submit pattern at STITCH_WRITE_WINDOW=1.
+    """
+    t_wait = _maybe_drain_oldest()
+    _record_band_writes(futures, data_refs)
+    return t_wait
+
+
+def _drain_all_bands():
+    """Drain every queued band slot. Called at well-final or job-final fences."""
+    global _band_window
+    while _band_window:
+        _drain_band_slot(_band_window.popleft())
+
+
+def _wait_band_writes():
+    """Compatibility shim — the previous semantics were `drain everything`,
+    which we now provide via _drain_all_bands().
+    """
+    _drain_all_bands()
 
 
 def _run_blosc_benchmark(sample_chunk):
@@ -240,6 +294,132 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
         return norm_cpu
 
 
+def _process_y_band_gpu_t_chunked(
+    y0, y1, total_x, y_tiles, tile_cache, final_shape,
+    dtype_val, use_edt, tile_weights, t_chunk: int,
+    profile: bool = False,
+):
+    """T-chunked variant of _process_y_band_gpu.
+
+    Designed for ISS-style bands where final_shape[0] (cycles) is large.
+    Builds the host (T, C, Z, band_h, total_x) result incrementally by
+    looping over T-chunks of width ``t_chunk``. Each chunk allocates its
+    own (numer_chunk, denom_chunk) on the GPU sized for t_chunk timepoints
+    rather than the full T, so the per-worker GPU peak drops by T / t_chunk.
+
+    Always returns a host numpy array. Forgoes the GPU-return / pipelined-D2H
+    optimization in the unchunked path because here each chunk's D2H is
+    interleaved with the next chunk's compute via the cupy default stream;
+    the caller's pipeline still works at the band granularity.
+
+    Average and EDT blending are both safe under T-chunking: per-tile
+    accumulation is independent across the leading T axis (no cross-T
+    dependencies anywhere in the kernel), so addition order is preserved
+    within each chunk and the final stitched output is bit-identical.
+    """
+    import numpy as _np
+
+    if profile:
+        xp.cuda.Device().synchronize()
+        t0 = time.time()
+
+    T = int(final_shape[0])
+    C = int(final_shape[1])
+    Z = int(final_shape[2])
+    band_height = y1 - y0
+
+    # numpy.dtype handles both a numpy class (e.g. numpy.float16) and a
+    # numpy.dtype instance directly.
+    host_dtype = _np.dtype(dtype_val)
+
+    norm_cpu = _np.zeros((T, C, Z, band_height, total_x), dtype=host_dtype)
+
+    n_chunks = (T + t_chunk - 1) // t_chunk
+    if profile:
+        timings = {"n_chunks": n_chunks, "t_chunk": t_chunk}
+        t_chunk_total = 0.0
+    else:
+        timings = None
+
+    for t0_chunk in range(0, T, t_chunk):
+        t1_chunk = min(t0_chunk + t_chunk, T)
+        chunk_t = t1_chunk - t0_chunk
+        if profile:
+            t_chunk_start = time.time()
+
+        numer = xp.zeros(
+            (chunk_t, C, Z, band_height, total_x), dtype=dtype_val,
+        )
+        denom = xp.zeros_like(numer, dtype=dtype_val)
+
+        for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in y_tiles:
+            iy0 = max(y0, ys)
+            iy1 = min(y1, ye)
+            ix0 = max(0, xs)
+            ix1 = min(total_x, xe)
+            if ix0 >= ix1 or iy0 >= iy1:
+                continue
+            # Skip tiles that don't overlap this chunk's T range.
+            if t_end <= t0_chunk:
+                continue
+            tt1 = min(t1_chunk, t_end)
+            local_chunk_t = tt1 - t0_chunk
+            if local_chunk_t <= 0:
+                continue
+
+            tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+            out_sl = (
+                slice(0, local_chunk_t),
+                slice(0, c_end),
+                slice(0, z_end),
+                slice(iy0 - y0, iy1 - y0),
+                slice(ix0, ix1),
+            )
+            tile_sl = (
+                slice(t0_chunk, tt1),
+                slice(0, c_end),
+                slice(0, z_end),
+                slice(iy0 - ys, iy1 - ys),
+                slice(ix0 - xs, ix1 - xs),
+            )
+            cpu_slice = tile_full[tile_sl]
+            block = xp.asarray(cpu_slice, dtype=dtype_val)
+
+            if use_edt:
+                wloc = tile_weights[
+                    (iy0 - ys) : (iy1 - ys), (ix0 - xs) : (ix1 - xs)
+                ]
+                wloc = xp.asarray(wloc, dtype=dtype_val)
+                nz = block != 0
+                wloc = wloc * nz
+                numer[out_sl] += block * wloc
+                denom[out_sl] += wloc
+            else:
+                numer[out_sl] += block
+                denom[out_sl] += (block != 0).astype(dtype_val)
+
+        xp.maximum(denom, 1e-12, out=denom)
+        xp.divide(numer, denom, out=numer)
+        del denom
+        xp.get_default_memory_pool().free_all_blocks()
+        xp.nan_to_num(numer, copy=False)
+
+        norm_cpu[t0_chunk:t1_chunk, :, :, :, :] = _to_numpy(numer)
+        del numer
+        xp.get_default_memory_pool().free_all_blocks()
+
+        if profile:
+            t_chunk_total += time.time() - t_chunk_start
+
+    if profile:
+        xp.cuda.Device().synchronize()
+        timings["wall"] = time.time() - t0
+        timings["chunk_total"] = t_chunk_total
+        return norm_cpu, timings
+
+    return norm_cpu
+
+
 def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
                         dtype_val, use_edt, tile_weights, profile=False,
                         return_gpu=False):
@@ -253,8 +433,26 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
 
     Caller should wrap this in a per-well CUDA stream context to avoid
     default-stream serialization across wells.
+
+    STITCH_T_CHUNK env var: when set to N>0 and N<C, processes the band in
+    chunks of N channels at a time, reducing per-worker GPU peak. Forces the
+    return-CPU code path (return_gpu is treated as False) since chunked
+    accumulation builds a host result incrementally. Designed for ISS where
+    final_shape[1] is large (cycles × channels stacked); defaults off so
+    track/pheno keep the existing fast path unchanged.
     """
     timings = {} if profile else None
+
+    # Optional T-chunking — see docstring.
+    t_chunk_env = int(os.environ.get("STITCH_T_CHUNK", "0") or "0")
+    full_t = int(final_shape[0])
+    use_t_chunk = t_chunk_env > 0 and t_chunk_env < full_t
+    if use_t_chunk:
+        return _process_y_band_gpu_t_chunked(
+            y0, y1, total_x, y_tiles, tile_cache, final_shape,
+            dtype_val, use_edt, tile_weights, t_chunk_env,
+            profile=profile,
+        )
 
     if profile:
         xp.cuda.Device().synchronize()
@@ -390,7 +588,11 @@ def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
     ensures the DMA engine handles the copy independently of the compute stream.
     """
     with transfer_stream:
-        norm_cpu = norm_gpu.get()  # syncs transfer_stream only, then DMA copy
+        # _to_numpy handles both cupy arrays (DMA via the active stream)
+        # and host numpy arrays (no-op view) — the latter occurs when
+        # _process_y_band_gpu took its T-chunked branch which already
+        # produced a host accumulator.
+        norm_cpu = _to_numpy(norm_gpu)
     del norm_gpu
     # Release GPU memory immediately so other parallel wells can use it
     xp.get_default_memory_pool().free_all_blocks()
@@ -1113,19 +1315,18 @@ def _stitch_band_dask_worker(well_id, band_idx, y0, y1, y_tiles,
         )
         t_gpu_elapsed = time.time() - t_gpu
 
-        # D2H transfer
+        # D2H transfer (no-op when norm_gpu is already a host numpy array,
+        # which happens under the T-chunked path)
         t_d2h = time.time()
-        norm_cpu = norm_gpu.get()
+        norm_cpu = _to_numpy(norm_gpu)
         del norm_gpu, tile_cache
         xp.get_default_memory_pool().free_all_blocks()
         t_d2h_elapsed = time.time() - t_d2h
 
-        # Wait for previous band's writes AFTER load+GPU+D2H completes.
-        # This lets writes overlap with load+GPU of the current band.
-        # Requires enough CPUs (128) so write threads don't starve load threads.
-        t_wait = time.time()
-        _wait_band_writes()
-        t_wait_elapsed = time.time() - t_wait
+        # Drain oldest slot first if window is full — keeps the thread-
+        # pool queue ordering identical to the legacy code at window=1
+        # (drain-prior-then-submit).
+        t_wait_elapsed = _maybe_drain_oldest()
 
         # One-time blosc compression benchmark (first band only)
         _run_blosc_benchmark(
@@ -1133,26 +1334,26 @@ def _stitch_band_dask_worker(well_id, band_idx, y0, y1, y_tiles,
         )
 
         # Submit writes to persistent pool (non-blocking).
-        global _band_write_submit_time
-        _band_write_submit_time = time.time()
         pool = _init_band_write_pool()
+        new_futures = []
         n_blocks = 0
         for x0 in range(0, total_x, tx):
             x1 = min(total_x, x0 + tx)
-            _band_pending_futures.append(pool.submit(
+            new_futures.append(pool.submit(
                 _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1,
                 norm_cpu[:, :, :, :, x0:x1]
             ))
             n_blocks += 1
-        # Keep norm_cpu alive until writes finish (prevent GC)
-        _band_pending_data.append(norm_cpu)
+
+        # Record this band in the window (no drain — already done above).
+        _record_band_writes(new_futures, [norm_cpu])
         print(f"[Band Worker] Submitted {n_blocks} write blocks, "
               f"{norm_cpu.nbytes/1e9:.2f}GB ({norm_cpu.dtype})")
 
-        # For the last band of a well, wait for writes to fully complete
+        # For the last band of a well, drain everything still in flight
         if is_last_band:
             t_flush = time.time()
-            _wait_band_writes()
+            _drain_all_bands()
             t_flush_elapsed = time.time() - t_flush
             print(f"[Band Worker] Final flush well={well_id}: {t_flush_elapsed:.1f}s")
 
@@ -1178,11 +1379,25 @@ def _stitch_band_dask_worker(well_id, band_idx, y0, y1, y_tiles,
 _prefetch_executor = None
 
 
+def _read_depth() -> int:
+    """STITCH_READ_DEPTH bounds how many bands' tile loads run concurrently
+    with GPU compute. depth=1 reproduces the legacy single-prefetch
+    behaviour (one band ahead). depth>1 keeps multiple band-loads in
+    flight, paying off only when NFS read bandwidth has slack."""
+    try:
+        return max(1, int(os.environ.get("STITCH_READ_DEPTH", "1") or "1"))
+    except ValueError:
+        return 1
+
+
 def _init_prefetch_executor():
     global _prefetch_executor
     if _prefetch_executor is None:
+        # Pool size matches read depth — each prefetch task runs a
+        # joblib-or-thread-pool _load_band_tiles internally, so a single
+        # thread is enough to dispatch and wait on it.
         _prefetch_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="prefetch"
+            max_workers=max(1, _read_depth()), thread_name_prefix="prefetch"
         )
     return _prefetch_executor
 
@@ -1218,8 +1433,19 @@ def _stitch_bands_loop_worker(
     )
 
     prefetch_pool = _init_prefetch_executor()
-    prefetch_future = None
+    read_depth = _read_depth()
+    # Deque of in-flight prefetches: each entry is (target_band_index, future).
+    # FIFO — index 0 is the next band's load.
+    prefetch_queue: "deque" = deque()
     results = []
+
+    # Prime the queue by submitting the first `read_depth` bands ahead.
+    # Band 0 is loaded fresh below (cold path), so prime starts at band 1.
+    for ahead in range(1, min(read_depth, len(band_list))):
+        ahead_y_tiles = band_list[ahead][4]
+        prefetch_queue.append((ahead, prefetch_pool.submit(
+            _load_band_tiles, ahead_y_tiles, fov_store_p, flipud, fliplr, rot90,
+        )))
 
     for i, (well_id, band_idx, y0, y1, y_tiles, final_shape, is_last) in enumerate(band_list):
         gpu_timings = None
@@ -1238,29 +1464,39 @@ def _stitch_bands_loop_worker(
                     mode="r+",
                 )
 
-                # ---- Load tiles: from prefetch or blocking load ----
-                # On retry prefetch_future has been cancelled, always cold-load.
+                # ---- Load tiles: pop matching prefetch or blocking load ----
+                # On retry the prefetch for THIS band may have been cancelled;
+                # fall back to a cold load. The deque can also hold prefetches
+                # for bands i+1 ... i+depth-1 — leave those alone.
                 t_load = time.time()
-                if prefetch_future is not None:
-                    tile_cache = prefetch_future.result()
+                tile_cache = None
+                if prefetch_queue and prefetch_queue[0][0] == i:
+                    _, fut = prefetch_queue.popleft()
+                    tile_cache = fut.result()
                     t_load_elapsed = time.time() - t_load
                     load_src = "prefetch"
                 else:
                     tile_cache = _load_band_tiles(
-                        y_tiles, fov_store_p, flipud, fliplr, rot90
+                        y_tiles, fov_store_p, flipud, fliplr, rot90,
                     )
                     t_load_elapsed = time.time() - t_load
                     load_src = "cold"
 
-                # ---- Start prefetching next band BEFORE GPU work ----
-                # GPU releases GIL → prefetch threads get uncontested GIL access
-                prefetch_future = None
-                if i + 1 < len(band_list):
-                    next_y_tiles = band_list[i + 1][4]  # y_tiles field
-                    prefetch_future = prefetch_pool.submit(
-                        _load_band_tiles,
-                        next_y_tiles, fov_store_p, flipud, fliplr, rot90,
-                    )
+                # ---- Top up the prefetch queue ----
+                # After consuming i, queue's frontmost prefetch is for i+1
+                # (if any). Submit a new prefetch for i+read_depth so the
+                # queue stays read_depth-1 ahead of the consumer (since the
+                # current band's tile_cache is also held alive).
+                next_to_submit = i + read_depth
+                if next_to_submit < len(band_list):
+                    nts_y_tiles = band_list[next_to_submit][4]
+                    prefetch_queue.append((
+                        next_to_submit,
+                        prefetch_pool.submit(
+                            _load_band_tiles,
+                            nts_y_tiles, fov_store_p, flipud, fliplr, rot90,
+                        ),
+                    ))
 
                 # ---- GPU process this Y-band ----
                 t_gpu = time.time()
@@ -1277,35 +1513,37 @@ def _stitch_bands_loop_worker(
                 t_gpu_elapsed = time.time() - t_gpu
 
                 # ---- D2H transfer ----
+                # _to_numpy is a no-op when norm_gpu is already a host
+                # numpy array (T-chunked path); otherwise issues the
+                # standard cupy DMA copy.
                 t_d2h = time.time()
-                norm_cpu = norm_gpu.get()
+                norm_cpu = _to_numpy(norm_gpu)
                 del norm_gpu, tile_cache
                 xp.get_default_memory_pool().free_all_blocks()
                 t_d2h_elapsed = time.time() - t_d2h
 
-                # ---- Wait for previous band's writes ----
-                t_wait = time.time()
-                _wait_band_writes()
-                t_wait_elapsed = time.time() - t_wait
+                # ---- Drain oldest slot if window full (legacy ordering) ----
+                t_wait_elapsed = _maybe_drain_oldest()
 
                 # One-time blosc benchmark
                 _run_blosc_benchmark(
                     np.ascontiguousarray(norm_cpu[0, 0, 0, :, :tx])
                 )
 
-                # ---- Submit writes to persistent pool (non-blocking) ----
-                global _band_write_submit_time
-                _band_write_submit_time = time.time()
+                # ---- Build write futures for THIS band ----
                 pool = _init_band_write_pool()
+                new_futures = []
                 n_blocks = 0
                 for x0 in range(0, total_x, tx):
                     x1 = min(total_x, x0 + tx)
-                    _band_pending_futures.append(pool.submit(
+                    new_futures.append(pool.submit(
                         _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1,
                         norm_cpu[:, :, :, :, x0:x1],
                     ))
                     n_blocks += 1
-                _band_pending_data.append(norm_cpu)
+
+                # ---- Record in window (no drain — already done above) ----
+                _record_band_writes(new_futures, [norm_cpu])
                 print(
                     f"[Band Worker] Submitted {n_blocks} write blocks, "
                     f"{norm_cpu.nbytes/1e9:.2f}GB ({norm_cpu.dtype})"
@@ -1314,7 +1552,7 @@ def _stitch_bands_loop_worker(
                 # Flush on last band of a well
                 if is_last:
                     t_flush = time.time()
-                    _wait_band_writes()
+                    _drain_all_bands()
                     t_flush_elapsed = time.time() - t_flush
                     print(
                         f"[Band Worker] Final flush well={well_id}: "
@@ -1353,11 +1591,11 @@ def _stitch_bands_loop_worker(
                     f"well={well_id} band={band_idx+1}: {e}"
                 )
                 traceback.print_exc()
-                # Cancel any prefetch that was started for the next band so the
-                # retry does a fresh cold load instead of a potentially stale one.
-                if prefetch_future is not None:
-                    prefetch_future.cancel()
-                    prefetch_future = None
+                # Note: with STITCH_READ_DEPTH>=1 the prefetch queue holds
+                # futures for FUTURE bands (i+1 ... i+depth), not the
+                # currently-failing band. Leave them in flight — they're
+                # still useful for the next iteration. The retry path
+                # cold-loads its own tiles via the `else` branch above.
                 # Flush GPU memory pools to recover from OOM before retrying.
                 try:
                     xp.get_default_memory_pool().free_all_blocks()
@@ -1497,13 +1735,33 @@ def stitch(
         print(f"[Dask Bands] Wells: {well_ids}")
 
         # Resolve divide_tile_size for Y-band computation and write chunking
-        # Band size and output chunks MUST match to avoid concurrent writes to the same chunk
+        # Band size and output chunks MUST match to avoid concurrent writes to the same chunk.
+        #
+        # Three env knobs to tune metadata vs storage layout:
+        #   STITCH_TILE_YX=4096      — bumps Y/X chunk and band size (default 2048).
+        #   STITCH_CHUNK_TC=1        — collapse leading T,C dims into ONE chunk
+        #                              (default 0 = chunk=(1,1,1,...)). For ISS
+        #                              this drops file count 50× (per (T,C,Z) the
+        #                              chunk now holds all 50 leading positions).
+        #   STITCH_SHARD_RATIO_YX=N  — zarr v3 sharding with N×N chunks per shard
+        #                              (default 0 = stay v2, no shards).
         divide_tile_yx = kwargs.get("target_chunks_yx", (2048, 2048))
-        ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
-        chunks_size = (1, 1, 1, ty_band, tx_write)
+        tile_yx_env = int(os.environ.get("STITCH_TILE_YX", "0") or "0")
+        if tile_yx_env > 0:
+            ty_band = tx_write = tile_yx_env
+        else:
+            ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
+
+        chunk_tc = int(os.environ.get("STITCH_CHUNK_TC", "0") or "0") == 1
+        shard_ratio_yx = int(os.environ.get("STITCH_SHARD_RATIO_YX", "0") or "0")
+        use_v3_shards = shard_ratio_yx > 0
+
+        # chunks_size will be finalised per-well (needs T,C,Z from final_shape).
         blending_exponent = kwargs.get("blending_exponent", 1.0)
         value_precision_bits = kwargs.get("value_precision_bits", 32)
         dtype_val = _resolve_value_dtype(value_precision_bits)
+        print(f"[Dask Bands] chunks layout: tile_yx={ty_band} chunk_tc={chunk_tc} "
+              f"shard_ratio_yx={shard_ratio_yx} v3={use_v3_shards}")
 
         # Phase 1: Pre-create wells, compute Y-bands, build interleaved work queue
         work_queue = []
@@ -1520,27 +1778,55 @@ def stitch(
             first_tile_shape = tuple(meta["shape"])
             final_shape = first_tile_shape[:3] + final_shape_xy
 
-            # Create output position + zeros via iohub
-            stitched_pos = output_store.create_position("A", well_id, "0")
-            stitched_pos.create_zeros(
-                "0",
-                shape=final_shape,
-                chunks=chunks_size,
-                dtype=dtype_val,
-                transform=(
-                    [TransformationMeta(type="scale", scale=scale)]
-                    if scale is not None
-                    else None
-                ),
-            )
+            # Resolve per-well chunk geometry. With chunk_tc=True, collapse
+            # T,C into a single chunk so each (Y, X) block on disk holds the
+            # full leading-dim stack (one file per spatial chunk instead of
+            # T*C files).
+            tc_chunk = (final_shape[0], final_shape[1]) if chunk_tc else (1, 1)
+            chunks_size = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
 
-            # Override compressor: lz4 is 3x faster than zstd on dense
-            # float16 image data (5ms vs 16ms per 8MB chunk) with the same
-            # compression ratio (~2.1x). iohub hardcodes zstd; patch .zarray.
+            stitched_pos = output_store.create_position("A", well_id, "0")
+            if use_v3_shards:
+                # iohub.create_zeros() doesn't accept shards; drop down to the
+                # underlying zarr group and use create_array directly. This
+                # bypasses iohub's NGFF metadata helpers — we add a minimal
+                # multiscale entry afterwards if scale was requested.
+                inner_yx = max(1, ty_band // shard_ratio_yx)
+                v3_chunks = (1, 1, 1, inner_yx, inner_yx)
+                v3_shards = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
+                pos_grp = stitched_pos.zgroup  # underlying zarr group
+                pos_grp.create_array(
+                    "0",
+                    shape=final_shape,
+                    dtype=dtype_val,
+                    chunks=v3_chunks,
+                    shards=v3_shards,
+                    fill_value=0,
+                )
+                if well_id == well_ids[0]:
+                    print(f"[Dask Bands] zarr v3 layout: chunks={v3_chunks} "
+                          f"shards={v3_shards}")
+            else:
+                stitched_pos.create_zeros(
+                    "0",
+                    shape=final_shape,
+                    chunks=chunks_size,
+                    dtype=dtype_val,
+                    transform=(
+                        [TransformationMeta(type="scale", scale=scale)]
+                        if scale is not None
+                        else None
+                    ),
+                )
+
+            # Override compressor (zarr v2 path only): lz4 is 3x faster than
+            # zstd on dense float16 image data (5ms vs 16ms per 8MB chunk)
+            # with the same compression ratio (~2.1x). iohub hardcodes zstd;
+            # patch .zarray. Zarr v3 has its own codec block — leave it.
             zarray_path = (
                 Path(output_store_path) / "A" / well_id / "0" / "0" / ".zarray"
             )
-            if zarray_path.exists():
+            if not use_v3_shards and zarray_path.exists():
                 with open(zarray_path) as f:
                     zmeta = json.load(f)
                 old_cname = zmeta.get("compressor", {}).get("cname", "?")
@@ -1627,11 +1913,19 @@ def stitch(
 
             # Peak band size across the whole work_queue: each item carries
             # final_shape; band height is at most ty_band; band width is the
-            # full stitched x extent (final_shape[-1]).
+            # full stitched x extent (final_shape[-1]). When STITCH_T_CHUNK is
+            # set, the per-worker peak is bounded by the chunk size in the
+            # leading-channel dim, not the full C — so the divisor shrinks
+            # proportionally and we can safely pack more workers per GPU.
             itemsize = int(np.dtype(dtype_val).itemsize)
+            t_chunk_env = int(os.environ.get("STITCH_T_CHUNK", "0") or "0")
             peak_band_bytes = 0
             for _wid, _bidx, _y0, _y1, _yts, _fshape, _is_last in work_queue:
-                t_c_z = int(_fshape[0]) * int(_fshape[1]) * int(_fshape[2])
+                t = int(_fshape[0])
+                c = int(_fshape[1])
+                z = int(_fshape[2])
+                effective_t = min(t_chunk_env, t) if t_chunk_env > 0 else t
+                t_c_z = effective_t * c * z
                 band_h = int(min(ty_band, _fshape[-2] - _y0))
                 band_w = int(_fshape[-1])
                 array_bytes = t_c_z * band_h * band_w * itemsize
@@ -1642,6 +1936,19 @@ def stitch(
             # and the prefetched-tile cache.
             peak_gb_per_worker = (4 * peak_band_bytes) / 1e9 + 4.0
             workers_per_gpu = max(1, int(per_gpu_gb // peak_gb_per_worker))
+            # STITCH_WORKERS_PER_GPU overrides the auto-derived count — useful
+            # when you want a small number of workers fed by deep read prefetch
+            # / large write window (saturating GPU with less host-RAM
+            # contention than packing more workers).
+            override = os.environ.get("STITCH_WORKERS_PER_GPU", "")
+            try:
+                override_n = int(override) if override else 0
+            except ValueError:
+                override_n = 0
+            if override_n > 0:
+                print(f"[Dask Bands] STITCH_WORKERS_PER_GPU override: "
+                      f"{workers_per_gpu} → {override_n}")
+                workers_per_gpu = override_n
             n_dask_workers = min(workers_per_gpu * n_gpus, len(work_queue))
             print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each, "
                   f"peak~{peak_gb_per_worker:.1f}GB/worker → "
