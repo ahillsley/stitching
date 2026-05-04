@@ -64,6 +64,16 @@ _blosc_benchmark_done = False
 from ops_utils.profiling.proc_monitor import start_monitor as _start_cpu_monitor
 
 
+def _v3_shards_attr(stitched_pos):
+    """Return the v3 shards_ratio that the outer stitch() set on this
+    position (None if the output is v2). This lets the assembly inner
+    functions pass shards_ratio to create_zeros without us having to
+    thread a parameter through every layer of the call chain — the outer
+    stitch() function tags each position right after it creates them.
+    """
+    return getattr(stitched_pos, "_v3_shards_ratio", None)
+
+
 def _init_band_write_pool(max_workers=8):
     """Get or create the persistent write thread pool for this worker process."""
     global _band_write_pool
@@ -942,8 +952,9 @@ def assemble_streaming(
     # Create output array on disk only (no auxiliary arrays)
     if arr_out is None:
         try:
-            stitched_pos.create_zeros(
-                "0",
+            v3_shards = _v3_shards_attr(stitched_pos)
+            create_kwargs = dict(
+                name="0",
                 shape=final_shape,
                 chunks=chunks_size,
                 dtype=dtype_val,
@@ -953,6 +964,9 @@ def assemble_streaming(
                     else None
                 ),
             )
+            if v3_shards is not None:
+                create_kwargs["shards_ratio"] = v3_shards
+            stitched_pos.create_zeros(**create_kwargs)
         except Exception:
             pass
 
@@ -1232,6 +1246,12 @@ def _process_single_well(well_id, shifts, output_store, input_store_path, tile_s
         # Thread-safe creation of stitched position
         with well_lock:
             stitched_pos = output_store.create_position("A", well_id, "0")
+            # Propagate v3 shards_ratio (if any) so downstream create_zeros calls
+            # write v3-formatted arrays. Tagged on the position because the inner
+            # functions don't know about it otherwise.
+            v3_shards = kwargs.get("v3_shards_ratio")
+            if v3_shards is not None:
+                stitched_pos._v3_shards_ratio = v3_shards
 
         # Process well (this is where GPU computation happens)
         assemble_streaming(
@@ -1684,10 +1704,57 @@ def stitch(
             pass
 
     # initialize output zarr store
+    # zarr_version controls the on-disk format: "0.4" for OME-Zarr v0.4 (zarr v2),
+    # "0.5" for OME-Zarr v0.5 (zarr v3 with sharding). Default keeps v2 behavior;
+    # callers opt in to v3-native by passing zarr_version="0.5". When v3 is on we
+    # also compute the channel-aware shard ratio (matches the standalone
+    # convert_v3 script's `calculate_channel_based_shards`) so a single-pass
+    # stitcher produces stores byte-equivalent to "v2 stitch + v3 conversion".
+    zarr_version = kwargs.get("zarr_version", "0.4")
+    if zarr_version not in ("0.4", "0.5"):
+        raise ValueError(f"zarr_version must be '0.4' or '0.5', got {zarr_version!r}")
+    use_v3_native = zarr_version == "0.5"
+
+    if use_v3_native:
+        # Channel-aware sharding to match convert_v3's recipe: one shard ≈ 1 GB,
+        # group all channels per shard, square spatial sharding for the rest.
+        # Same formula as ops_process/.../convert_v3.calculate_channel_based_shards.
+        n_ch = len(channel_names)
+        target_chunks_per_shard = 4096
+        spatial_shard_ratio = max(1, int((target_chunks_per_shard / n_ch) ** 0.5))
+        v3_native_shards_ratio = (1, n_ch, 1, spatial_shard_ratio, spatial_shard_ratio)
+        # Make the shards_ratio visible to all inner functions via kwargs —
+        # _process_single_well and the dask-bands path both read this key.
+        kwargs["v3_shards_ratio"] = v3_native_shards_ratio
+        print(f"[v3-native] channel-aware shards_ratio={v3_native_shards_ratio} "
+              f"(channels={n_ch}, target_chunks_per_shard={target_chunks_per_shard})")
+    else:
+        v3_native_shards_ratio = None
+
     output_store = open_ome_zarr(
-        output_store_path, layout="hcs", mode="w-", channel_names=channel_names
+        output_store_path, layout="hcs", mode="w-",
+        channel_names=channel_names,
+        version=zarr_version,
     )
-    print("output store created")
+    print(f"output store created (zarr_version={zarr_version})")
+
+    # When v3-native, mirror initialize_v3_store's channels_metadata zattrs so
+    # downstream tools (zarr_inspector_data, napari) see the same plate-level
+    # metadata they'd see after run_v3_conversion. Best-effort — failures here
+    # are non-fatal because the conversion script's metadata helper isn't
+    # always importable from the stitch submodule.
+    if use_v3_native:
+        try:
+            from ops_analysis.processes.convert_v3 import build_channels_metadata
+            cm = build_channels_metadata(channel_names, experiment=kwargs.get("experiment"))
+            if cm:
+                root = zarr.open(str(output_store_path), mode="r+")
+                attrs = dict(root.attrs)
+                attrs["channels_metadata"] = cm
+                root.attrs.update(attrs)
+                print(f"[v3-native] wrote channels_metadata for {len(cm)} channels to plate root")
+        except Exception as e:
+            print(f"[v3-native] WARN: could not write channels_metadata ({e})")
 
     # Determine parallelization strategy based on parallel_mode and hardware
     use_dask_wells = False
@@ -1753,15 +1820,20 @@ def stitch(
             ty_band, tx_write = int(divide_tile_yx[0]), int(divide_tile_yx[1])
 
         chunk_tc = int(os.environ.get("STITCH_CHUNK_TC", "0") or "0") == 1
+        # Two ways to enable v3 sharding in the Dask-bands path:
+        #  - kwargs["v3_shards_ratio"]: outer stitch() set this when zarr_version="0.5"
+        #  - STITCH_SHARD_RATIO_YX env var: legacy escape hatch for v2-plate experiments
+        v3_shards_ratio_kw = kwargs.get("v3_shards_ratio")
         shard_ratio_yx = int(os.environ.get("STITCH_SHARD_RATIO_YX", "0") or "0")
-        use_v3_shards = shard_ratio_yx > 0
+        use_v3_shards = (v3_shards_ratio_kw is not None) or (shard_ratio_yx > 0)
 
         # chunks_size will be finalised per-well (needs T,C,Z from final_shape).
         blending_exponent = kwargs.get("blending_exponent", 1.0)
         value_precision_bits = kwargs.get("value_precision_bits", 32)
         dtype_val = _resolve_value_dtype(value_precision_bits)
         print(f"[Dask Bands] chunks layout: tile_yx={ty_band} chunk_tc={chunk_tc} "
-              f"shard_ratio_yx={shard_ratio_yx} v3={use_v3_shards}")
+              f"v3_shards_ratio_kw={v3_shards_ratio_kw} "
+              f"shard_ratio_yx_env={shard_ratio_yx} v3={use_v3_shards}")
 
         # Phase 1: Pre-create wells, compute Y-bands, build interleaved work queue
         work_queue = []
@@ -1787,25 +1859,40 @@ def stitch(
 
             stitched_pos = output_store.create_position("A", well_id, "0")
             if use_v3_shards:
-                # iohub.create_zeros() doesn't accept shards; drop down to the
-                # underlying zarr group and use create_array directly. This
-                # bypasses iohub's NGFF metadata helpers — we add a minimal
-                # multiscale entry afterwards if scale was requested.
-                inner_yx = max(1, ty_band // shard_ratio_yx)
-                v3_chunks = (1, 1, 1, inner_yx, inner_yx)
-                v3_shards = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
-                pos_grp = stitched_pos.zgroup  # underlying zarr group
-                pos_grp.create_array(
+                # Prefer the channel-aware shards_ratio that outer stitch()
+                # computed (v3-native path). Fall back to the env-var formula
+                # for legacy users still passing STITCH_SHARD_RATIO_YX.
+                if v3_shards_ratio_kw is not None:
+                    v3_shards = tuple(v3_shards_ratio_kw)
+                    # Derive chunks from shards: chunks_per_shard ≈ shards_ratio,
+                    # so inner spatial chunk = shard_yx // shard_ratio_yx (=1 for
+                    # the channel-aware case, but generalises if outer wants 2x2).
+                    v3_chunks = (1, 1, 1, ty_band // v3_shards[3] if v3_shards[3] else ty_band,
+                                 tx_write // v3_shards[4] if v3_shards[4] else tx_write)
+                else:
+                    inner_yx = max(1, ty_band // shard_ratio_yx)
+                    v3_chunks = (1, 1, 1, inner_yx, inner_yx)
+                    v3_shards = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
+
+                # Use iohub create_zeros (it accepts shards_ratio in modern
+                # iohub) so multiscales/transform metadata is written by the
+                # NGFF helper and zarr_inspector_data sees a fully-formed
+                # OME-Zarr v0.5 array.
+                stitched_pos.create_zeros(
                     "0",
                     shape=final_shape,
-                    dtype=dtype_val,
                     chunks=v3_chunks,
-                    shards=v3_shards,
-                    fill_value=0,
+                    shards_ratio=v3_shards,
+                    dtype=dtype_val,
+                    transform=(
+                        [TransformationMeta(type="scale", scale=scale)]
+                        if scale is not None
+                        else None
+                    ),
                 )
                 if well_id == well_ids[0]:
                     print(f"[Dask Bands] zarr v3 layout: chunks={v3_chunks} "
-                          f"shards={v3_shards}")
+                          f"shards_ratio={v3_shards}")
             else:
                 stitched_pos.create_zeros(
                     "0",
