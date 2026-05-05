@@ -2337,7 +2337,15 @@ def stitch(
     n_workers = None
 
     if parallel_mode == "auto":
-        if _USING_CUPY and _DASK_DISTRIBUTED_AVAILABLE:
+        if _USING_CUPY and v3_native_shards_ratio is not None:
+            # v3 sharded outputs benefit most from shard-stripe parallelism:
+            # workers own disjoint shards so commits never conflict, and
+            # tile reads partition cleanly across stripes (1/N NFS load
+            # per worker). 3.5× faster end-to-end on real bench vs the
+            # legacy wells-thread/dask paths.
+            use_stripe_workers = True
+            print("[stitch] Auto mode: GPU + v3 detected, using shard-stripe multiprocess strategy")
+        elif _USING_CUPY and _DASK_DISTRIBUTED_AVAILABLE:
             use_dask_wells = True
             print("[stitch] Auto mode: GPU + Dask detected, using Dask multiprocess wells strategy")
         elif _USING_CUPY:
