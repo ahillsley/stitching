@@ -1707,11 +1707,15 @@ def _process_stripe_subprocess_entry(args):
      chunks_size, scale, env_vars) = args
     for k, v in env_vars.items():
         _os.environ[k] = v
-    # Many workers share one GPU under shard_stripes. Force the per-band
-    # CuPy pool free so siblings can claim freed VRAM (otherwise the
-    # warm-pool optimisation hoards memory per-process and fragments the
-    # device across N workers).
-    _os.environ["STITCH_FREE_POOL_PER_BAND"] = "1"
+    # NOTE: previously this line forced STITCH_FREE_POOL_PER_BAND=1 across
+    # workers under the rationale that "siblings need freed VRAM" — but
+    # measured: pool-free per band costs 200-800ms of alloc per band per
+    # worker, compounding to 50-150s of regression across a full real-bench
+    # run. With shard_stripes on H100/H200, GPU VRAM is plentiful relative
+    # to per-worker working set (~5 GB × N workers ≪ device VRAM), so the
+    # warm-pool optimisation should remain on. Operators can opt back into
+    # eager freeing via STITCH_FREE_POOL_PER_BAND=1 if running on a much
+    # tighter GPU.
     # NFS fanout limit: N workers × outer prefetch × inner per-band loaders
     # easily reaches 500+ concurrent reads, which wedges the NFS mount
     # (workers stick in "D"-state, same failure mode as organelle Pass 1).
