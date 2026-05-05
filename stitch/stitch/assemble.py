@@ -2191,6 +2191,37 @@ def _stitch_bands_loop_worker(
     return results
 
 
+def _write_v3_channels_metadata(
+    output_store_path: str, channel_names: list, experiment: str | None
+):
+    """Mirror convert_v3's plate-root channels_metadata block.
+
+    Must run AFTER iohub's output_store.close(). Writing while the iohub
+    plate is still open gets clobbered when subsequent create_position()
+    calls flush their cached attrs back to disk. Same pattern as
+    convert_v3.copy_zarrv2_to_zarrv3 (zarr.open r+ then attrs.update).
+    Best-effort — non-fatal on failure.
+    """
+    try:
+        from ops_analysis.processes.convert_v3 import build_channels_metadata
+    except Exception as e:
+        print(f"[v3-native] WARN: build_channels_metadata import failed ({e})")
+        return
+    try:
+        cm = build_channels_metadata(channel_names, experiment=experiment)
+        if not cm:
+            return
+        root = zarr.open(str(output_store_path), mode="r+")
+        existing = dict(root.attrs)
+        existing["channels_metadata"] = cm
+        root.attrs.update(existing)
+        print(
+            f"[v3-native] wrote channels_metadata for {len(cm)} channels to plate root"
+        )
+    except Exception as e:
+        print(f"[v3-native] WARN: could not write channels_metadata ({e})")
+
+
 def stitch(
     config_path: str,
     input_store_path: str,
@@ -2310,23 +2341,10 @@ def stitch(
     )
     print(f"output store created (zarr_version={zarr_version})")
 
-    # When v3-native, mirror initialize_v3_store's channels_metadata zattrs so
-    # downstream tools (zarr_inspector_data, napari) see the same plate-level
-    # metadata they'd see after run_v3_conversion. Best-effort — failures here
-    # are non-fatal because the conversion script's metadata helper isn't
-    # always importable from the stitch submodule.
-    if use_v3_native:
-        try:
-            from ops_analysis.processes.convert_v3 import build_channels_metadata
-            cm = build_channels_metadata(channel_names, experiment=kwargs.get("experiment"))
-            if cm:
-                root = zarr.open(str(output_store_path), mode="r+")
-                attrs = dict(root.attrs)
-                attrs["channels_metadata"] = cm
-                root.attrs.update(attrs)
-                print(f"[v3-native] wrote channels_metadata for {len(cm)} channels to plate root")
-        except Exception as e:
-            print(f"[v3-native] WARN: could not write channels_metadata ({e})")
+    # NOTE: channels_metadata is written at the END of stitch() (after all
+    # output_store writes are complete) — see _write_v3_channels_metadata.
+    # Writing it here gets clobbered when iohub flushes plate-root attrs on
+    # subsequent create_position calls and close().
 
     # Determine parallelization strategy based on parallel_mode and hardware
     use_dask_wells = False
@@ -3023,6 +3041,11 @@ def stitch(
             raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
 
         print(f"[Sequential Wells] All {num_wells} wells processed successfully!")
+
+    if use_v3_native:
+        _write_v3_channels_metadata(
+            output_store_path, channel_names, kwargs.get("experiment")
+        )
 
     return
 
