@@ -1154,6 +1154,7 @@ def assemble_streaming(
     per_channel_edt: bool = True,
     parallel_y_bands: bool = False,
     n_workers: Optional[int] = None,
+    y_range: Optional[Tuple[int, int]] = None,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -1286,16 +1287,35 @@ def assemble_streaming(
     ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
     total_y, total_x = final_shape[-2], final_shape[-1]
 
-    # Pre-identify all Y-bands and their tiles for batch loading
+    # Pre-identify all Y-bands and their tiles for batch loading.
+    # When y_range=(ys_lo, ys_hi) is set (shard-stripe parallelism), only
+    # bands fully inside the requested Y range are emitted. Band starts
+    # remain on chunk-aligned multiples of ty so stripe boundaries that
+    # are also chunk-aligned (e.g. shard cell heights = 14*1024) cleanly
+    # partition the work.
     y_bands = []
-    for y0 in range(0, total_y, ty):
-        y1 = min(total_y, y0 + ty)
+    if y_range is not None:
+        y_lo, y_hi = y_range
+        y_lo = max(0, int(y_lo))
+        y_hi = min(int(total_y), int(y_hi))
+    else:
+        y_lo, y_hi = 0, total_y
+    # Snap loop start to a multiple of ty so chunk-aligned stripes pick up
+    # only the bands fully inside their range.
+    start = (y_lo // ty) * ty
+    for y0 in range(start, y_hi, ty):
+        if y0 < y_lo:
+            continue
+        y1 = min(y_hi, y0 + ty)
         y_tiles = [
             (nm, t_end, c_end, z_end, ys, ye, xs, xe)
             for (nm, t_end, c_end, z_end, ys, ye, xs, xe) in tile_meta
             if not (ye <= y0 or ys >= y1)
         ]
         y_bands.append((y0, y1, y_tiles))
+    if not y_bands:
+        print(f"[assemble.streaming] No bands in y_range={y_range}; nothing to do")
+        return arr_out
 
     # Pipeline: prefetch multiple Y-bands ahead so tiles are ready when GPU needs them.
     # On 32-CPU production nodes NFS-bound tile reads benefit from more concurrency.
@@ -1649,6 +1669,78 @@ def _process_well_subprocess_entry(args):
         print(f"[Process Wells] Worker for well {well_id} failed: {e}")
         traceback.print_exc()
         return well_id, False
+
+
+def _process_stripe_subprocess_entry(args):
+    """Module-level entry for ``parallel_mode='shard_stripes'``.
+
+    Each task processes a horizontal Y-stripe of one well. Multiple
+    stripes can run concurrently on separate Python processes, so:
+      - Tile reads are partitioned (each worker only loads tiles
+        overlapping its stripe → ~1/N NFS read traffic per worker).
+      - Output writes are partitioned by Y range → workers never write
+        to the same shard rows → independent tensorstore commits.
+      - Memory per worker scales with stripe size, not well size.
+
+    Args is a tuple of pickleable values. The output array is assumed
+    to already be created by the parent (so workers don't race on
+    create_zeros / plate metadata).
+    """
+    import os as _os
+    (well_id, y_start, y_end, shifts, output_store_path, input_store_path,
+     tile_shape, flipud, fliplr, rot90, kwargs, blending_method,
+     chunks_size, scale, env_vars) = args
+    for k, v in env_vars.items():
+        _os.environ[k] = v
+    # Many workers share one GPU under shard_stripes. Force the per-band
+    # CuPy pool free so siblings can claim freed VRAM (otherwise the
+    # warm-pool optimisation hoards memory per-process and fragments the
+    # device across N workers).
+    _os.environ["STITCH_FREE_POOL_PER_BAND"] = "1"
+    import zarr as _zarr
+    from stitch.stitch.assemble import assemble_streaming as _assemble
+
+    v3_shards = kwargs.get("v3_shards_ratio")
+
+    class _StripePositionStub:
+        """Same interface as iohub Position but reads + writes through
+        raw zarr (workers don't go through iohub). The output array is
+        opened existing — parent already created it."""
+        def __init__(self, group_path):
+            self._group_path = group_path
+            self._v3_shards_ratio = v3_shards
+        def __getitem__(self, key):
+            return _zarr.open(f"{self._group_path}/{key}", mode="r+")
+        def create_zeros(self, *a, **kw):
+            # Output array already exists — parent created it. No-op.
+            pass
+
+    try:
+        group_path = f"{output_store_path}/A/{well_id}/0"
+        stitched_pos = _StripePositionStub(group_path)
+
+        _assemble(
+            shifts=shifts,
+            tile_size=tile_shape[-2:],
+            fov_store_path=input_store_path,
+            stitched_pos=stitched_pos,
+            flipud=flipud, fliplr=fliplr, rot90=rot90,
+            tcz_policy=kwargs.get("tcz_policy", "min"),
+            blending_method=blending_method,
+            blending_exponent=kwargs.get("blending_exponent", 1.0),
+            value_precision_bits=kwargs.get("value_precision_bits", 32),
+            chunks_size=chunks_size,
+            scale=scale,
+            divide_tile_size=kwargs.get("target_chunks_yx", (1024, 1024)),
+            profile=kwargs.get("profile", False),
+            y_range=(y_start, y_end),
+        )
+        return (well_id, y_start, y_end, True)
+    except Exception as e:
+        import traceback
+        print(f"[Stripe] Worker for well {well_id} stripe [{y_start}:{y_end}] failed: {e}")
+        traceback.print_exc()
+        return (well_id, y_start, y_end, False)
 
 
 def _process_single_well(well_id, shifts, output_store, input_store_path, tile_shape,
@@ -2061,7 +2153,7 @@ def stitch(
     fliplr: bool = False,
     rot90: int = 0,
     blending_method: Literal["average", "edt"] = "edt",
-    parallel_mode: Literal["auto", "wells", "wells_threads", "y_bands", "sequential"] = "auto",
+    parallel_mode: Literal["auto", "wells", "wells_threads", "wells_processes", "shard_stripes", "y_bands", "sequential"] = "auto",
     **kwargs,
 ):
     """Mimic of biahub stitch function
@@ -2182,6 +2274,7 @@ def stitch(
     use_dask_wells = False
     use_thread_wells = False
     use_process_wells = False
+    use_stripe_workers = False
     use_parallel_y_bands = False
     n_workers = None
 
@@ -2209,6 +2302,9 @@ def stitch(
     elif parallel_mode == "wells_processes":
         use_process_wells = True
         print("[stitch] Forced multiprocess wells strategy (spawn, true GIL bypass)")
+    elif parallel_mode == "shard_stripes":
+        use_stripe_workers = True
+        print("[stitch] Forced shard-stripe multiprocess strategy")
     elif parallel_mode == "y_bands":
         use_parallel_y_bands = True
         n_workers = _get_optimal_workers(use_gpu=False, verbose=True)
@@ -2699,6 +2795,140 @@ def stitch(
         if failed_wells:
             print(f"[Process Wells] Failed: {len(failed_wells)} wells: {failed_wells}")
             raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
+
+    elif use_stripe_workers:
+        # SHARD-STRIPE MULTIPROCESS — partition each well's Y range into
+        # chunk-aligned stripes and run them across a worker pool.
+        # Workers never write to the same shard rows → no commit conflict;
+        # tile reads partition cleanly → much less NFS contention than
+        # whole-well multiprocess; memory per worker scales with stripe
+        # size (smaller buffers per worker = fits more workers in RAM).
+        import multiprocessing as _mp
+        from concurrent.futures import ProcessPoolExecutor as _PPE
+
+        stripes_per_well = max(1, int(os.environ.get("STITCH_STRIPES_PER_WELL", "4")))
+        max_workers_env = int(os.environ.get(
+            "STITCH_STRIPE_WORKERS",
+            str(min(num_wells * stripes_per_well, 6))
+        ))
+        # Pre-create plate, positions, AND output arrays in the parent so
+        # workers don't race on iohub writes. Workers open the array as
+        # raw zarr.
+        for well_id in well_ids:
+            try:
+                pos = output_store.create_position("A", well_id, "0")
+                v3_shards_in = kwargs.get("v3_shards_ratio")
+                if v3_shards_in is not None:
+                    pos._v3_shards_ratio = v3_shards_in
+                # Pre-create the output array so workers can open as r+
+                final_shape = output_store.get_well_final_shape("A", well_id) \
+                    if hasattr(output_store, "get_well_final_shape") else None
+                # Fall back to computing it from the shifts the worker would use.
+                if final_shape is None:
+                    well_shifts = grouped_shifts[well_id]
+                    final_shape_xy = get_output_shape(well_shifts, tile_shape[-2:])
+                    # Match the pattern used inside assemble_streaming
+                    final_shape = (
+                        tile_shape[0], tile_shape[1], tile_shape[2],
+                        final_shape_xy[0], final_shape_xy[1],
+                    )
+                from iohub.ngff import TransformationMeta as _TM
+                create_kwargs = dict(
+                    name="0",
+                    shape=final_shape,
+                    chunks=chunks_size,
+                    dtype=_resolve_value_dtype(kwargs.get("value_precision_bits", 32)),
+                    transform=([_TM(type="scale", scale=scale)] if scale is not None else None),
+                )
+                if v3_shards_in is not None:
+                    wb_y, wb_x = chunks_size[3], chunks_size[4]
+                    rsy = max(1, wb_y // 512); rsx = max(1, wb_x // 512)
+                    create_kwargs["shards_ratio"] = (
+                        v3_shards_in[0], v3_shards_in[1], v3_shards_in[2],
+                        max(1, v3_shards_in[3] // rsy),
+                        max(1, v3_shards_in[4] // rsx),
+                    )
+                try:
+                    pos.create_zeros(**create_kwargs)
+                except Exception as e:
+                    print(f"[Stripes] WARN: pre-create array {well_id} failed: {e}")
+            except Exception as e:
+                print(f"[Stripes] WARN: pre-create position {well_id} failed: {e}")
+        output_store.close()
+        del output_store
+
+        env_to_forward = {
+            k: v for k, v in os.environ.items()
+            if k.startswith("STITCH_") or k.startswith("CUDA_") or k.startswith("OMP_")
+            or k.startswith("MKL_") or k.startswith("OPENBLAS_") or k.startswith("NUMEXPR_")
+        }
+
+        # Build (well, stripe) tasks. CRITICAL: stripe boundaries must
+        # snap to SHARD CELL height, not chunk height. Multiple stripes
+        # writing into the same shard race on commit (each worker has its
+        # own tensorstore Transaction; commits are not coordinated, so
+        # the second commit overwrites the first). Aligning to shard
+        # cells ensures each shard is fully owned by exactly one worker.
+        v3_shards_in = kwargs.get("v3_shards_ratio")
+        ty_band = chunks_size[3]
+        if v3_shards_in is not None:
+            wb_y = chunks_size[3]
+            rsy = max(1, wb_y // 512)
+            shard_ratio_y = max(1, v3_shards_in[3] // rsy)
+            shard_cell_y = ty_band * shard_ratio_y
+        else:
+            shard_cell_y = ty_band
+        all_tasks = []
+        for well_id in well_ids:
+            well_shifts = grouped_shifts[well_id]
+            final_shape_xy = get_output_shape(well_shifts, tile_shape[-2:])
+            total_y_well = int(final_shape_xy[0])
+            # Cap stripes at the number of shard rows available
+            n_shard_rows = max(1, (total_y_well + shard_cell_y - 1) // shard_cell_y)
+            n_stripes_eff = min(stripes_per_well, n_shard_rows)
+            if n_stripes_eff < stripes_per_well:
+                print(f"[Stripes] Capped well {well_id} from {stripes_per_well} to "
+                      f"{n_stripes_eff} stripes (only {n_shard_rows} shard rows)")
+            # Distribute shard rows across stripes. Each stripe owns a
+            # contiguous block of shard rows; last stripe takes any leftover.
+            shards_per_stripe = n_shard_rows // n_stripes_eff
+            cuts = [i * shards_per_stripe * shard_cell_y for i in range(n_stripes_eff)]
+            cuts.append(total_y_well)
+            for y_start, y_end in zip(cuts[:-1], cuts[1:]):
+                if y_end <= y_start:
+                    continue
+                # Pass FULL shifts so assemble_streaming computes the correct
+                # global final_shape. Filtering shifts to "tiles in this
+                # stripe" makes get_output_shape return a smaller total_y,
+                # which in turn clamps y_range and corrupts stripe writes.
+                # The band-vs-tile intersection filter inside the band loop
+                # only loads tiles that actually overlap each band, so
+                # passing full shifts costs little — most tiles outside the
+                # stripe are never loaded.
+                all_tasks.append((
+                    well_id, y_start, y_end, well_shifts, output_store_path,
+                    input_store_path, tile_shape, flipud, fliplr, rot90,
+                    kwargs, blending_method, chunks_size, scale, env_to_forward,
+                ))
+
+        print(f"[Stripes] Dispatching {len(all_tasks)} tasks across {max_workers_env} workers "
+              f"({stripes_per_well} stripes/well × {num_wells} wells)")
+
+        ctx = _mp.get_context("spawn")
+        completed = []
+        failed = []
+        with _PPE(max_workers=max_workers_env, mp_context=ctx) as ex:
+            for result in ex.map(_process_stripe_subprocess_entry, all_tasks):
+                well_id, y_start, y_end, ok = result
+                if ok:
+                    completed.append((well_id, y_start, y_end))
+                else:
+                    failed.append((well_id, y_start, y_end))
+
+        print(f"[Stripes] Completed {len(completed)}/{len(all_tasks)} tasks")
+        if failed:
+            print(f"[Stripes] Failed: {failed}")
+            raise RuntimeError(f"Failed to process {len(failed)} stripes: {failed}")
 
     else:
         # SEQUENTIAL WELL PROCESSING with optional parallel Y-bands
