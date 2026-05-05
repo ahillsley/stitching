@@ -21,6 +21,36 @@ import threading
 import time
 from joblib import Parallel, delayed
 
+# Optional override of iohub's default zstd codec for v3 outputs.
+# STITCH_V3_CODEC=lz4 → faster encode, larger files.
+# STITCH_V3_CODEC=zstd (default) → iohub default (clevel=1, bitshuffle).
+# STITCH_V3_CODEC=none → no compression, fastest commits, biggest files.
+_v3_codec_env = os.environ.get("STITCH_V3_CODEC", "").strip().lower()
+if _v3_codec_env in ("lz4", "none"):
+    try:
+        import iohub.ngff.nodes as _ngff_nodes
+        import zarr.codecs as _zc
+        _orig_create_compressor_options = _ngff_nodes.Position._create_compressor_options
+
+        def _patched_create_compressor_options(self):
+            shuffle = _zc.BloscShuffle.bitshuffle
+            if self._zarr_format == 3:
+                if _v3_codec_env == "none":
+                    return {"compressors": None}
+                return {
+                    "compressors": _zc.BloscCodec(
+                        cname=_v3_codec_env, clevel=1, shuffle=shuffle,
+                    )
+                }
+            # v2 path unchanged
+            return _orig_create_compressor_options(self)
+
+        _ngff_nodes.Position._create_compressor_options = _patched_create_compressor_options
+        print(f"[v3-codec] Overriding iohub default zstd → {_v3_codec_env}")
+    except Exception as e:
+        print(f"[v3-codec] WARN: failed to patch iohub codec ({e}); using default zstd")
+
+
 try:
     from dask.distributed import LocalCluster, Client
     _DASK_DISTRIBUTED_AVAILABLE = True
@@ -64,6 +94,32 @@ _blosc_benchmark_done = False
 from ops_utils.profiling.proc_monitor import start_monitor as _start_cpu_monitor
 
 
+# Set True while >1 well shares the same GPU (use_thread_wells / use_dask_wells)
+# so per-band cleanup hands blocks back to CUDA and other workers can grab them.
+# In single-well sequential mode we keep the pool warm — alloc cost drops from
+# 300-800ms to ~2-3ms per band (observed in py-spy + STITCH_PROFILE=1).
+_PARALLEL_WELLS_ACTIVE = False
+
+
+def _maybe_free_pool() -> None:
+    """Release CuPy memory-pool blocks back to CUDA driver only when needed.
+
+    Defaults: keep blocks (single-well case = fastest re-allocation).
+    Auto-flips to "free" when parallel wells are sharing one GPU.
+    Override via ``STITCH_FREE_POOL_PER_BAND=1`` (always free) or
+    ``STITCH_FREE_POOL_PER_BAND=0`` (never free, even under parallel wells —
+    only safe if the GPU has headroom for all wells' working sets).
+    """
+    override = os.environ.get("STITCH_FREE_POOL_PER_BAND", "")
+    if override in ("0", "false", "no"):
+        return
+    if override in ("1", "true", "yes") or _PARALLEL_WELLS_ACTIVE:
+        try:
+            xp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+
 def _v3_shards_attr(stitched_pos):
     """Return the v3 shards_ratio that the outer stitch() set on this
     position (None if the output is v2). This lets the assembly inner
@@ -72,6 +128,177 @@ def _v3_shards_attr(stitched_pos):
     stitch() function tags each position right after it creates them.
     """
     return getattr(stitched_pos, "_v3_shards_ratio", None)
+
+
+class _TensorStoreWriteAdapter:
+    """Adapter that makes a tensorstore-backed array support numpy-style
+    ``arr[slices] = value`` assignment.
+
+    zarr-python 3.1's sharding codec has a path in ``encode_partial`` that
+    silently loses data on certain unaligned slice writes (we observed
+    scattered missing chunks even for nominally aligned writes via
+    ``stitched_pos["0"][...] = block``). The convert_v3 conversion script
+    sidesteps this by routing all writes through tensorstore, whose
+    sharding implementation correctly handles partial-shard
+    read-modify-writes.
+
+    This adapter wraps a tensorstore handle and exposes ``__setitem__`` so
+    the existing stitcher write call sites
+    (``arr_out[(s, s, s, slice(y0,y1), slice(x0,x1))] = norm_cpu``) keep
+    working without invasive changes. ``__getattr__`` and ``shape`` /
+    ``chunks`` attribute pass-through let the rest of the code interact
+    with it like a zarr/iohub array.
+    """
+
+    def __init__(self, ts_array, shape, chunks=None, dtype=None,
+                 use_transaction: bool = True):
+        self._ts = ts_array
+        self.shape = tuple(shape)
+        self.chunks = tuple(chunks) if chunks is not None else None
+        self.dtype = dtype
+        # Sharded v3 writes are catastrophically slow without coalescing:
+        # each X-block write triggers a full shard read-modify-write
+        # (~358ms per write × 2548 writes/well ≈ 970s drain on real bench).
+        # We commit every STITCH_TXN_BAND_GROUP bands (default 8) — staging
+        # ~16 GB per txn — to bound peak memory. Per-WELL txn (1 commit)
+        # OOM'd at 368 GB on real bench; per-BAND txn (52 commits) is
+        # memory-safe but ~80s slower from extra shard re-encodes.
+        self._use_transaction = use_transaction
+        self._txn = None
+        self._pending_commits = []  # in-flight async commits from prior groups
+        self._txn_lock = threading.Lock()
+        # Bands written into the current txn since it was opened.
+        self._band_count_in_txn = 0
+        # Default 999 = act as per-well (single commit at end of well).
+        # Smaller values trade more frequent commits for bounded memory.
+        self._band_group_size = max(1, int(os.environ.get("STITCH_TXN_BAND_GROUP", "999")))
+
+    def begin_band(self):
+        """Lazy-open a Transaction if one isn't already active. Single
+        Transaction batches up to ``_band_group_size`` bands' worth of
+        X-block writes before commit, balancing shard-re-encode count
+        (fewer = better wall) against staged-memory peak (smaller = no OOM)."""
+        if not self._use_transaction:
+            return
+        if self._txn is not None:
+            return
+        try:
+            import tensorstore as _ts
+            with self._txn_lock:
+                if self._txn is None:
+                    self._txn = _ts.Transaction()
+                    self._band_count_in_txn = 0
+        except Exception as e:
+            print(f"[v3-native] WARN: Transaction unavailable ({e}); falling back to non-coalesced writes")
+            self._txn = None
+
+    def end_band_async(self):
+        """Mark a band's writes as staged. Commit and reset the txn when
+        ``_band_group_size`` bands have accumulated, capping memory."""
+        with self._txn_lock:
+            self._band_count_in_txn += 1
+            if self._band_count_in_txn < self._band_group_size:
+                return
+            txn = self._txn
+            self._txn = None
+            self._band_count_in_txn = 0
+        if txn is not None:
+            self._pending_commits.append(txn.commit_async())
+
+    @property
+    def txn_view(self):
+        """Returns the tensorstore handle bound to the open transaction (if
+        any) so writes accumulate before commit."""
+        with self._txn_lock:
+            txn = self._txn
+        if txn is not None:
+            return self._ts.with_transaction(txn)
+        return self._ts
+
+    def __setitem__(self, key, value):
+        self.txn_view[key].write(value).result()
+
+    def __getitem__(self, key):
+        return self.txn_view[key].read().result()
+
+    def commit(self):
+        """Final drain: commit any live txn, then wait on all pending
+        async commits. Called once at end of well.
+
+        In sequential mode this is THE single per-well commit (~4 shard
+        re-encodes). In parallel-wells mode end_band_async has already
+        kicked off per-band commits; this just drains them."""
+        with self._txn_lock:
+            txn = self._txn
+            self._txn = None
+        if txn is not None:
+            # Issue the commit; reuse the same drain loop below.
+            self._pending_commits.append(txn.commit_async())
+        for fut in self._pending_commits:
+            fut.result()
+        self._pending_commits = []
+
+    def __getattr__(self, name):
+        return getattr(self._ts, name)
+
+
+def _maybe_wrap_for_tensorstore(arr_obj, stitched_pos=None):
+    """If ``arr_obj`` is backed by a v3 sharded zarr array (detected via the
+    position's ``_v3_shards_ratio`` tag), return a ``_TensorStoreWriteAdapter``
+    wrapping its tensorstore handle. Otherwise return ``arr_obj`` unchanged.
+
+    Inputs:
+      - ``arr_obj``: an iohub ImageArray or raw zarr Array
+      - ``stitched_pos``: optional iohub Position used to detect v3-sharded mode
+    """
+    use_ts = False
+    if stitched_pos is not None and _v3_shards_attr(stitched_pos) is not None:
+        use_ts = True
+    if not use_ts:
+        return arr_obj
+    try:
+        import tensorstore as ts
+        # Override tensorstore's default thread pools so the commit phase
+        # can saturate our SLURM core allocation. Defaults are small (~4-8
+        # for data_copy_concurrency) and we observed only ~18 cores in use
+        # during commit on a 32-core allocation. Env-var tunable.
+        _ts_dc = int(os.environ.get("STITCH_TS_DATA_COPY_CONCURRENCY", "32"))
+        _ts_io = int(os.environ.get("STITCH_TS_FILE_IO_CONCURRENCY", "16"))
+        ts_context = ts.Context({
+            "data_copy_concurrency": {"limit": _ts_dc},
+            "file_io_concurrency": {"limit": _ts_io},
+        })
+
+        # iohub ImageArray exposes .tensorstore(); raw zarr arrays don't.
+        if hasattr(arr_obj, "tensorstore"):
+            base_ts = arr_obj.tensorstore()
+            # Reopen with our context so concurrency limits apply. The spec
+            # already encodes the storage location and codec.
+            try:
+                ts_array = ts.open(base_ts.spec(), context=ts_context).result()
+            except Exception:
+                ts_array = base_ts  # fall back to iohub's default context
+        else:
+            # For raw zarr v3 arrays, we need to open them via tensorstore
+            # ourselves. The path is reachable via the array's store info.
+            store_root = str(arr_obj.store.root) if hasattr(arr_obj.store, "root") else None
+            arr_path = arr_obj.path  # e.g. "A/1/0/0"
+            if store_root is None:
+                return arr_obj  # can't wrap; fall back to direct writes
+            full_path = f"{store_root}/{arr_path}" if arr_path else store_root
+            ts_array = ts.open({
+                "driver": "zarr3",
+                "kvstore": {"driver": "file", "path": full_path},
+            }, context=ts_context).result()
+        return _TensorStoreWriteAdapter(
+            ts_array,
+            shape=arr_obj.shape,
+            chunks=getattr(arr_obj, "chunks", None),
+            dtype=getattr(arr_obj, "dtype", None),
+        )
+    except Exception as e:
+        print(f"[v3-native] WARN: tensorstore wrap failed ({e}); using direct zarr writes")
+        return arr_obj
 
 
 def _init_band_write_pool(max_workers=8):
@@ -549,15 +776,17 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
         timings['slice_cpu'] = t_slice_cpu_total
         timings['h2d'] = t_h2d_total
         timings['gpu_kernel'] = t_gpu_kernel_total
+        timings['num_streams'] = num_streams
         t_norm = time.time()
 
     # Normalize in-place to minimize GPU memory (avoids ~20GB of temporaries)
     xp.maximum(denom, 1e-12, out=denom)
     xp.divide(numer, denom, out=numer)
     del denom
-    # Release CuPy memory pool's hold on denom + tile temporaries.
-    # Reduces GPU footprint from ~15GB to ~7GB before D2H, giving headroom for other workers.
-    xp.get_default_memory_pool().free_all_blocks()
+    # Pool blocks are kept by default for next band's alloc; opt-in via
+    # STITCH_FREE_POOL_PER_BAND=1 for the parallel-wells-per-GPU case
+    # where cross-worker pool fragmentation matters more than alloc cost.
+    _maybe_free_pool()
     xp.nan_to_num(numer, copy=False)
     norm = numer  # just rename, no allocation
 
@@ -604,17 +833,39 @@ def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
         # produced a host accumulator.
         norm_cpu = _to_numpy(norm_gpu)
     del norm_gpu
-    # Release GPU memory immediately so other parallel wells can use it
-    xp.get_default_memory_pool().free_all_blocks()
+    # See _maybe_free_pool: pool blocks kept for next band's alloc by default.
+    _maybe_free_pool()
+
+    # v3-native: open a per-band transaction so X-block writes coalesce
+    # into one re-encode per shard at commit time. Per-band (vs per-well)
+    # bounds memory: a full-well txn staged ~110 GB on real bench and
+    # OOM'd at 413 GB across 3 parallel wells.
+    band_started = False
+    if hasattr(arr_out, "begin_band"):
+        arr_out.begin_band()
+        band_started = True
 
     # Split into X-block chunks for zarr chunk alignment
+    band_write_futures = []
     for x0 in range(0, total_x, tx):
         x1 = min(total_x, x0 + tx)
         block_cpu = norm_cpu[:, :, :, :, x0:x1]
         fut = _write_executor.submit(
             _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, block_cpu
         )
+        band_write_futures.append(fut)
         _write_futures.append(fut)
+
+    # If we opened a band txn, drain its X-block stages before committing.
+    # Stages are memory ops (cheap; ~1ms per write per the synth bench),
+    # so this drain typically finishes in <100ms even for 52 X-blocks.
+    if band_started:
+        for fut in band_write_futures:
+            fut.result()
+        # commit_async returns immediately; the next band can start GPU
+        # work while the prior commit re-encodes shards in tensorstore's
+        # internal threads. Final drain happens in arr_out.commit().
+        arr_out.end_band_async()
 
 
 def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
@@ -637,29 +888,50 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
     return data_bytes, time.time() - t0
 
 
-def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90):
+def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90,
+                     well_cache=None, well_cache_lock=None):
     """Load all tiles for a Y-band in parallel, returning a tile_cache dict.
 
     Uses direct zarr array access (bypasses iohub HCS metadata parsing).
     Used for pipelined I/O: loading band N+1 while GPU processes band N.
+
+    When ``well_cache`` is provided, tiles are cached across bands within
+    a well — overlap means each tile would otherwise be re-read 2-3× by
+    adjacent bands. With a 200-px overlap on 2048-px tiles + 1024-px Y-bands,
+    each tile sees roughly 2 bands, so caching halves NFS read volume.
+    The cache is keyed by tile_name; entries hold the augmented numpy
+    array (~80 MB for production 5ch×2048² float32 tiles).
     """
-    tile_cache = {}
+    # Local view of just the tiles needed for this band — returned to caller.
+    band_view = {}
 
     def _load_single(tile_meta):
         tile_name, t_end, c_end, z_end, ys, ye, xs, xe = tile_meta
+        # Cache hit: reuse the already-loaded augmented tile.
+        if well_cache is not None:
+            cached = well_cache.get(tile_name)
+            if cached is not None:
+                return tile_name, cached
         tile_full = zarr.open(str(store_path / tile_name / "0"), mode="r")
-        # Keep tiles on CPU to avoid GPU memory contention between parallel wells.
-        # Tiles are transferred to GPU per-slice during band processing.
         tile_cpu = augment_tile(np.asarray(tile_full), flipud, fliplr, rot90)
-        return tile_name, (tile_cpu, t_end, c_end, z_end, ys, ye, xs, xe)
+        entry = (tile_cpu, t_end, c_end, z_end, ys, ye, xs, xe)
+        if well_cache is not None and well_cache_lock is not None:
+            with well_cache_lock:
+                # Double-checked: another thread may have populated while we read.
+                existing = well_cache.get(tile_name)
+                if existing is None:
+                    well_cache[tile_name] = entry
+                else:
+                    entry = existing
+        return tile_name, entry
 
     with ThreadPoolExecutor(max_workers=min(16, len(y_tiles))) as loader:
         futures = [loader.submit(_load_single, m) for m in y_tiles]
         for future in as_completed(futures):
             name, data = future.result()
-            tile_cache[name] = data
+            band_view[name] = data
 
-    return tile_cache
+    return band_view
 
 
 
@@ -952,7 +1224,7 @@ def assemble_streaming(
     # Create output array on disk only (no auxiliary arrays)
     if arr_out is None:
         try:
-            v3_shards = _v3_shards_attr(stitched_pos)
+            v3_shards_in = _v3_shards_attr(stitched_pos)
             create_kwargs = dict(
                 name="0",
                 shape=final_shape,
@@ -964,7 +1236,21 @@ def assemble_streaming(
                     else None
                 ),
             )
-            if v3_shards is not None:
+            # When v3-sharded, set a chunk-aligned shards_ratio. Writes
+            # go through a tensorstore adapter (see _maybe_wrap_for_tensorstore
+            # below) — convert_v3 does the same and gets correct partial-shard
+            # writes; raw zarr-python's sharding codec silently drops chunks.
+            if v3_shards_in is not None:
+                # Original ratio assumed chunks=(1,1,1,512,512); rescale spatial
+                # dims so that chunks × shards_ratio still gives ~1 GB shards.
+                wb_y, wb_x = chunks_size[3], chunks_size[4]
+                ratio_scale_y = max(1, wb_y // 512)
+                ratio_scale_x = max(1, wb_x // 512)
+                v3_shards = (
+                    v3_shards_in[0], v3_shards_in[1], v3_shards_in[2],
+                    max(1, v3_shards_in[3] // ratio_scale_y),
+                    max(1, v3_shards_in[4] // ratio_scale_x),
+                )
                 create_kwargs["shards_ratio"] = v3_shards
             stitched_pos.create_zeros(**create_kwargs)
         except Exception:
@@ -977,6 +1263,11 @@ def assemble_streaming(
 
     if arr_out is None:
         arr_out = stitched_pos["0"]
+        # If this is a v3-sharded output, route writes through tensorstore
+        # for correct partial-shard handling (zarr-python 3.1's sharding
+        # codec drops chunks on certain unaligned writes; tensorstore's
+        # implementation is what convert_v3 uses and is known correct).
+        arr_out = _maybe_wrap_for_tensorstore(arr_out, stitched_pos=stitched_pos)
     dtype_idx = _resolve_shift_dtype(shifts, tile_size, base_bits=32)
 
     # Precompute tile metadata for fast intersection checks (using cached shapes)
@@ -1007,10 +1298,11 @@ def assemble_streaming(
         y_bands.append((y0, y1, y_tiles))
 
     # Pipeline: prefetch multiple Y-bands ahead so tiles are ready when GPU needs them.
-    # With 2 concurrent loaders and 3-band prefetch, effective loading rate (~3.5s/band)
-    # roughly matches GPU processing rate (~2-3s/band), eliminating most tile-wait stalls.
-    _pipeline_executor = ThreadPoolExecutor(max_workers=2)
-    _prefetch_depth = 3
+    # On 32-CPU production nodes NFS-bound tile reads benefit from more concurrency.
+    # Tuned via STITCH_PIPELINE_WORKERS / STITCH_PREFETCH_DEPTH (defaults: 8, 5).
+    _pl_workers = int(os.environ.get("STITCH_PIPELINE_WORKERS", "8"))
+    _pipeline_executor = ThreadPoolExecutor(max_workers=_pl_workers)
+    _prefetch_depth = int(os.environ.get("STITCH_PREFETCH_DEPTH", "5"))
 
     # Background writer: submit zarr writes to a thread pool so GPU can
     # continue with the next Y-band while chunks are flushed to disk.
@@ -1024,10 +1316,20 @@ def assemble_streaming(
     _transfer_stream = xp.cuda.Stream(non_blocking=True) if _USING_CUPY else None
     _prev_d2h_future = None
 
+    # Per-well tile cache: with overlap (e.g. 200 px on 2048 px tiles +
+    # 1024 px Y-bands) each tile is needed by ~2 adjacent bands. Default
+    # off — empirical runs showed wash-or-regression vs no cache, possibly
+    # because the kernel NFS client cache already deduplicates re-reads.
+    # Set STITCH_TILE_CACHE=1 to enable.
+    _use_tile_cache = os.environ.get("STITCH_TILE_CACHE", "0") in ("1", "true", "yes")
+    _well_tile_cache = {} if _use_tile_cache else None
+    _well_tile_cache_lock = threading.Lock() if _use_tile_cache else None
+
     _load_futures = deque()
     for i in range(min(_prefetch_depth, len(y_bands))):
         _load_futures.append(_pipeline_executor.submit(
-            _load_band_tiles, y_bands[i][2], fov_store_p, flipud, fliplr, rot90
+            _load_band_tiles, y_bands[i][2], fov_store_p, flipud, fliplr, rot90,
+            _well_tile_cache, _well_tile_cache_lock,
         ))
 
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
@@ -1042,7 +1344,8 @@ def assemble_streaming(
         next_prefetch = band_idx + _prefetch_depth
         if next_prefetch < len(y_bands):
             _load_futures.append(_pipeline_executor.submit(
-                _load_band_tiles, y_bands[next_prefetch][2], fov_store_p, flipud, fliplr, rot90
+                _load_band_tiles, y_bands[next_prefetch][2], fov_store_p, flipud, fliplr, rot90,
+                _well_tile_cache, _well_tile_cache_lock,
             ))
 
         print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles (waited {t_load_elapsed:.2f}s)")
@@ -1077,15 +1380,20 @@ def assemble_streaming(
                 _write_executor, _write_futures,
             )
 
-            # Release freed GPU memory back to CUDA so other parallel wells
-            # can allocate from it. CuPy's memory pool holds onto freed blocks
-            # by default, which causes OOM when multiple wells share one GPU.
-            xp.get_default_memory_pool().free_all_blocks()
+            # See _maybe_free_pool: pool blocks kept for next band's alloc
+            # by default (saves 300-800ms/band of CUDA driver round-trips).
+            _maybe_free_pool()
 
             if profile:
+                # Break accum down into its CPU-slice / H2D / GPU-kernel components
+                # so we can see which dominates and which is parallelisable.
+                _sl = band_timings.get('slice_cpu', 0) * 1000
+                _h2d = band_timings.get('h2d', 0) * 1000
+                _gk = band_timings.get('gpu_kernel', 0) * 1000
                 print(f"  [Y-band {band_idx+1}/{len(y_bands)}] PROFILE: "
                       f"alloc={band_timings['alloc']*1000:.1f}ms  "
-                      f"accum={band_timings['accum']*1000:.1f}ms ({band_timings['n_tiles_hit']} tiles)  "
+                      f"accum={band_timings['accum']*1000:.1f}ms ({band_timings['n_tiles_hit']} tiles "
+                      f"= slice_cpu {_sl:.0f}ms + h2d {_h2d:.0f}ms + gpu_kernel {_gk:.0f}ms)  "
                       f"norm={band_timings['normalize']*1000:.1f}ms  "
                       f"total={t_process_elapsed:.2f}s (D2H pipelined)")
             else:
@@ -1226,7 +1534,121 @@ def assemble_streaming(
     print(f"  [Write drain] Waited {t_drain_elapsed:.2f}s for {len(_write_futures)} background writes"
           f"{f' ({n_failed} failed)' if n_failed else ''}")
 
+    # v3-native: tensorstore transaction commit. All X-block writes have
+    # staged into the per-position transaction; commit now coalesces them
+    # per-shard (one re-encode per shard, instead of one per X-block).
+    if hasattr(arr_out, "commit"):
+        t_commit_start = time.time()
+        arr_out.commit()
+        print(f"  [Txn commit] {time.time() - t_commit_start:.2f}s "
+              f"(coalesced {len(_write_futures)} writes per shard)")
+
     return arr_out
+
+
+def _process_well_subprocess_entry(args):
+    """Module-level entry point for ``parallel_mode='wells_processes'``.
+
+    Each well runs in its own spawn-spawned Python interpreter — independent
+    CUDA context, independent tensorstore handle, independent tile prefetch
+    pool. CPU-side work and tensorstore commits truly parallel across wells
+    (no GIL). GPU-side work is multiplexed by the CUDA driver across the
+    sibling processes' contexts (effectively time-sliced unless MPS is
+    enabled).
+
+    Args is a tuple so it pickles cleanly across the spawn boundary.
+    """
+    import os as _os
+    (well_id, shifts, output_store_path, input_store_path, tile_shape,
+     flipud, fliplr, rot90, kwargs, blending_method, chunks_size, scale,
+     env_vars) = args
+
+    # Propagate the parent's STITCH_* / CUDA_* env so codec/concurrency
+    # overrides are honoured in the subprocess.
+    for k, v in env_vars.items():
+        _os.environ[k] = v
+
+    # Re-import in subprocess (triggers iohub codec patch on stitch import)
+    from iohub.ngff import open_ome_zarr as _open
+    from stitch.stitch.assemble import assemble_streaming as _assemble
+
+    try:
+        # Bypass iohub entirely in the worker. iohub's r+ mode fails to
+        # populate ``_channel_names`` on Plate, Row, Well, Position
+        # objects (the private attribute the inner navigation code
+        # references), and patching each level is fragile. Instead open
+        # the position's array directly via raw zarr and pass a tiny
+        # stub to assemble_streaming that mimics the only iohub Position
+        # attributes the streaming path actually uses (__getitem__,
+        # create_zeros, _v3_shards_ratio).
+        import zarr as _zarr
+        v3_shards = kwargs.get("v3_shards_ratio")
+
+        class _PositionStub:
+            """Minimal stand-in for an iohub Position. Backed by a raw
+            zarr group at ``A/{well_id}/0``. The output array (``"0"``)
+            is created on demand by assemble_streaming; if it already
+            exists (parent pre-created), create_zeros catches the error
+            and the streaming path falls through to ``self["0"]``."""
+            def __init__(self, group_path):
+                self._group_path = group_path
+                self._group = _zarr.open(group_path, mode="r+")
+                self._v3_shards_ratio = v3_shards
+
+            def __getitem__(self, key):
+                arr_path = f"{self._group_path}/{key}"
+                return _zarr.open(arr_path, mode="r+")
+
+            def create_zeros(self, name, shape, dtype, chunks=None,
+                              shards_ratio=None, transform=None,
+                              check_shape=True):
+                # Match iohub's create_zeros signature. Use raw zarr
+                # to materialise the v3 array. Skip if it already exists.
+                arr_path = f"{self._group_path}/{name}"
+                try:
+                    if shards_ratio is not None:
+                        shards = tuple(c * r for c, r in zip(chunks, shards_ratio))
+                        return _zarr.create_array(
+                            store=arr_path, shape=shape, dtype=dtype,
+                            chunks=chunks, shards=shards,
+                            zarr_format=3, overwrite=False,
+                        )
+                    return _zarr.create_array(
+                        store=arr_path, shape=shape, dtype=dtype,
+                        chunks=chunks, zarr_format=3, overwrite=False,
+                    )
+                except Exception:
+                    # Already exists — assemble_streaming's outer try/except
+                    # handles this case.
+                    pass
+
+        group_path = f"{output_store_path}/A/{well_id}/0"
+        try:
+            stitched_pos = _PositionStub(group_path)
+
+            _assemble(
+                shifts=shifts,
+                tile_size=tile_shape[-2:],
+                fov_store_path=input_store_path,
+                stitched_pos=stitched_pos,
+                flipud=flipud, fliplr=fliplr, rot90=rot90,
+                tcz_policy=kwargs.get("tcz_policy", "min"),
+                blending_method=blending_method,
+                blending_exponent=kwargs.get("blending_exponent", 1.0),
+                value_precision_bits=kwargs.get("value_precision_bits", 32),
+                chunks_size=chunks_size,
+                scale=scale,
+                divide_tile_size=kwargs.get("target_chunks_yx", (1024, 1024)),
+                profile=kwargs.get("profile", False),
+            )
+            return well_id, True
+        except Exception:
+            raise
+    except Exception as e:
+        import traceback
+        print(f"[Process Wells] Worker for well {well_id} failed: {e}")
+        traceback.print_exc()
+        return well_id, False
 
 
 def _process_single_well(well_id, shifts, output_store, input_store_path, tile_shape,
@@ -1759,6 +2181,7 @@ def stitch(
     # Determine parallelization strategy based on parallel_mode and hardware
     use_dask_wells = False
     use_thread_wells = False
+    use_process_wells = False
     use_parallel_y_bands = False
     n_workers = None
 
@@ -1783,6 +2206,9 @@ def stitch(
     elif parallel_mode == "wells_threads":
         use_thread_wells = True
         print("[stitch] Forced threaded wells strategy (legacy)")
+    elif parallel_mode == "wells_processes":
+        use_process_wells = True
+        print("[stitch] Forced multiprocess wells strategy (spawn, true GIL bypass)")
     elif parallel_mode == "y_bands":
         use_parallel_y_bands = True
         n_workers = _get_optimal_workers(use_gpu=False, verbose=True)
@@ -1863,12 +2289,28 @@ def stitch(
                 # computed (v3-native path). Fall back to the env-var formula
                 # for legacy users still passing STITCH_SHARD_RATIO_YX.
                 if v3_shards_ratio_kw is not None:
+                    # Match convert_v3's recipe exactly: chunks=(1,1,1,512,512)
+                    # and shards_ratio computed by calculate_channel_based_shards.
+                    # 512 must evenly divide the write-block dims; we ensure that
+                    # by making ty_band/tx_write multiples of 512 below.
+                    v3_chunks = (1, 1, 1, 512, 512)
                     v3_shards = tuple(v3_shards_ratio_kw)
-                    # Derive chunks from shards: chunks_per_shard ≈ shards_ratio,
-                    # so inner spatial chunk = shard_yx // shard_ratio_yx (=1 for
-                    # the channel-aware case, but generalises if outer wants 2x2).
-                    v3_chunks = (1, 1, 1, ty_band // v3_shards[3] if v3_shards[3] else ty_band,
-                                 tx_write // v3_shards[4] if v3_shards[4] else tx_write)
+                    # Round write block to nearest multiple of 512 so block
+                    # writes align with chunk grid — otherwise sharded writes
+                    # at sub-chunk granularity end up zeroing parts of shards.
+                    if ty_band % 512:
+                        new_ty_band = ((ty_band // 512) or 1) * 512
+                        if well_id == well_ids[0]:
+                            print(f"[v3-native] adjusting ty_band {ty_band} → {new_ty_band} "
+                                  f"to align with chunk size 512")
+                        ty_band = new_ty_band
+                    if tx_write % 512:
+                        new_tx_write = ((tx_write // 512) or 1) * 512
+                        if well_id == well_ids[0]:
+                            print(f"[v3-native] adjusting tx_write {tx_write} → {new_tx_write} "
+                                  f"to align with chunk size 512")
+                        tx_write = new_tx_write
+                    chunks_size = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
                 else:
                     inner_yx = max(1, ty_band // shard_ratio_yx)
                     v3_chunks = (1, 1, 1, inner_yx, inner_yx)
@@ -2155,7 +2597,12 @@ def stitch(
         print(f"[Dask Bands] All {len(work_queue)} bands processed successfully!")
 
     elif use_thread_wells:
-        # THREADED WELL PROCESSING (legacy fallback) — GIL limits true parallelism
+        # THREADED WELL PROCESSING — wells overlap on the same GPU.
+        # Heavy work releases the GIL: zarr/NFS reads, CuPy kernels, NumPy
+        # ops, tensorstore writes, blosc compression. The "GIL-limited"
+        # legacy comment was conservative; in practice we see good overlap.
+        global _PARALLEL_WELLS_ACTIVE
+        _PARALLEL_WELLS_ACTIVE = True
         well_lock = threading.Lock()
         max_workers = min(4, num_wells)
 
@@ -2193,6 +2640,65 @@ def stitch(
             raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
 
         print(f"[Thread Wells] All {num_wells} wells processed successfully!")
+        _PARALLEL_WELLS_ACTIVE = False
+
+    elif use_process_wells:
+        # MULTIPROCESS WELL PROCESSING — separate Python interpreters.
+        # Each well gets its own CUDA context + tensorstore handle. CPU work
+        # truly parallel (no GIL). GPU work multiplexed by the driver.
+        import multiprocessing as _mp
+        from concurrent.futures import ProcessPoolExecutor as _PPE
+
+        print(f"[Process Wells] Processing {num_wells} wells with multiprocess pool")
+        print(f"[Process Wells] Wells: {well_ids}")
+
+        # Pre-create positions in the parent so iohub's plate metadata is
+        # flushed to disk before workers open the store (otherwise iohub's
+        # _detect_layout raises KeyError on a plate without 'plate' attrs).
+        for well_id in well_ids:
+            try:
+                pos = output_store.create_position("A", well_id, "0")
+                v3_shards = kwargs.get("v3_shards_ratio")
+                if v3_shards is not None:
+                    pos._v3_shards_ratio = v3_shards
+            except Exception as e:
+                print(f"[Process Wells] WARN: pre-create position {well_id} failed: {e}")
+
+        # Workers re-open the output store; close the parent's handle.
+        output_store.close()
+        del output_store
+
+        # Forward the env knobs that workers care about.
+        env_to_forward = {
+            k: v for k, v in os.environ.items()
+            if k.startswith("STITCH_") or k.startswith("CUDA_") or k.startswith("OMP_")
+            or k.startswith("MKL_") or k.startswith("OPENBLAS_") or k.startswith("NUMEXPR_")
+        }
+
+        args_list = [
+            (well_id, grouped_shifts[well_id], output_store_path, input_store_path,
+             tile_shape, flipud, fliplr, rot90, kwargs, blending_method,
+             chunks_size, scale, env_to_forward)
+            for well_id in well_ids
+        ]
+
+        ctx = _mp.get_context("spawn")
+        # Cap worker count: more workers ≠ better when contending for one GPU
+        # and one NFS link. STITCH_PROCESS_WELLS_WORKERS overrides default.
+        max_workers = int(os.environ.get("STITCH_PROCESS_WELLS_WORKERS", str(min(num_wells, 4))))
+        completed_wells = []
+        failed_wells = []
+        with _PPE(max_workers=max_workers, mp_context=ctx) as ex:
+            for well_id, ok in ex.map(_process_well_subprocess_entry, args_list):
+                if ok:
+                    completed_wells.append(well_id)
+                else:
+                    failed_wells.append(well_id)
+
+        print(f"[Process Wells] Completed: {len(completed_wells)} wells: {completed_wells}")
+        if failed_wells:
+            print(f"[Process Wells] Failed: {len(failed_wells)} wells: {failed_wells}")
+            raise RuntimeError(f"Failed to process {len(failed_wells)} wells: {failed_wells}")
 
     else:
         # SEQUENTIAL WELL PROCESSING with optional parallel Y-bands
