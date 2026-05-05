@@ -264,7 +264,15 @@ def _maybe_wrap_for_tensorstore(arr_obj, stitched_pos=None):
         # during commit on a 32-core allocation. Env-var tunable.
         _ts_dc = int(os.environ.get("STITCH_TS_DATA_COPY_CONCURRENCY", "32"))
         _ts_io = int(os.environ.get("STITCH_TS_FILE_IO_CONCURRENCY", "16"))
+        # Bound the cache pool. Default tensorstore cache pool is unbounded
+        # and stores decoded shards/chunks. For a write-heavy workload like
+        # stitch we don't benefit from a big read cache — bounding it lets
+        # us fit more workers in the SLURM memory budget. 2 GB default is
+        # enough for tensorstore's internal scratch without growing
+        # unbounded across the run.
+        _ts_cache = int(os.environ.get("STITCH_TS_CACHE_BYTES", str(2 * 1024**3)))
         ts_context = ts.Context({
+            "cache_pool": {"total_bytes_limit": _ts_cache},
             "data_copy_concurrency": {"limit": _ts_dc},
             "file_io_concurrency": {"limit": _ts_io},
         })
@@ -925,7 +933,14 @@ def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90,
                     entry = existing
         return tile_name, entry
 
-    with ThreadPoolExecutor(max_workers=min(16, len(y_tiles))) as loader:
+    # Inner per-band tile-load thread pool. Default 16 is fine for a
+    # single-process run, but with N concurrent shard-stripe workers the
+    # aggregate NFS fanout (N × outer prefetch × 16) wedges the NFS mount
+    # ("D"-state stuck workers, observed in organelle step too). Tunable
+    # via STITCH_INNER_LOAD_THREADS — workers default to 4 to keep total
+    # concurrent NFS reads ~bounded.
+    _inner_max = int(os.environ.get("STITCH_INNER_LOAD_THREADS", "16"))
+    with ThreadPoolExecutor(max_workers=min(_inner_max, len(y_tiles))) as loader:
         futures = [loader.submit(_load_single, m) for m in y_tiles]
         for future in as_completed(futures):
             name, data = future.result()
@@ -1697,6 +1712,33 @@ def _process_stripe_subprocess_entry(args):
     # warm-pool optimisation hoards memory per-process and fragments the
     # device across N workers).
     _os.environ["STITCH_FREE_POOL_PER_BAND"] = "1"
+    # NFS fanout limit: N workers × outer prefetch × inner per-band loaders
+    # easily reaches 500+ concurrent reads, which wedges the NFS mount
+    # (workers stick in "D"-state, same failure mode as organelle Pass 1).
+    # Cap per-worker NFS concurrency so total stays within ~64-128.
+    # Caller can override by setting these env vars themselves.
+    _os.environ.setdefault("STITCH_PIPELINE_WORKERS", "2")
+    _os.environ.setdefault("STITCH_PREFETCH_DEPTH", "2")
+    _os.environ.setdefault("STITCH_INNER_LOAD_THREADS", "4")
+    # Auto-size tensorstore thread pools to match the per-worker share of
+    # the SLURM core allocation. Without this, each worker opens a 32-thread
+    # data_copy + 16-thread file_io pool — N workers all running commit
+    # simultaneously oversubscribes the cgroup (4×48=192 CPU-bound threads
+    # on 32 cores → context-switch + cache thrash). Total budget ≈ allocated
+    # cores; per-worker = cores / N. Operators can still override the env.
+    try:
+        n_w = int(_os.environ.get("STITCH_STRIPE_WORKERS", "4"))
+        n_cpus = int(_os.environ.get(
+            "SLURM_CPUS_PER_TASK",
+            _os.environ.get("OMP_NUM_THREADS_TOTAL", "32"),
+        ))
+        per_worker = max(2, n_cpus // max(1, n_w))
+        _os.environ.setdefault("STITCH_TS_DATA_COPY_CONCURRENCY", str(per_worker))
+        _os.environ.setdefault(
+            "STITCH_TS_FILE_IO_CONCURRENCY", str(max(2, per_worker // 2))
+        )
+    except Exception:
+        pass
     import zarr as _zarr
     from stitch.stitch.assemble import assemble_streaming as _assemble
 
