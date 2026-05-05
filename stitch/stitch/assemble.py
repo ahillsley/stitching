@@ -1146,6 +1146,50 @@ def assemble(
     return stitched
 
 
+# Thresholds for the NFS-contention warning emitted at the end of each
+# stripe. Tuned against pheno-2d on uncontended NFS:
+#   mean band wait ≈ 1-2s, max ≈ 10-30s, commit ≈ 10-20s, drain ≈ 0-2s.
+# When other tenants saturate the storage backend, mean band wait jumps
+# to 4-5s+, max to 60-90s, and commit to 40-90s.
+_NFS_WARN_BAND_WAIT_MEAN_S = 3.5
+_NFS_WARN_BAND_WAIT_MAX_S = 45.0
+_NFS_WARN_COMMIT_S = 35.0
+_NFS_WARN_DRAIN_S = 10.0
+
+
+def _nfs_warn(band_waits, commit_s, drain_s, n_writes, n_failed):
+    """Emit a single [NFS-CONTENTION] line to stderr when read or write
+    timings exceed the typical-load thresholds. Captured by SLURM stderr
+    + stdout, so post-mortem grep on slurm logs surfaces it cheaply."""
+    import sys
+    if not band_waits and not commit_s:
+        return
+    n = len(band_waits)
+    mean_w = (sum(band_waits) / n) if n else 0.0
+    max_w = max(band_waits) if band_waits else 0.0
+    flagged = []
+    if mean_w >= _NFS_WARN_BAND_WAIT_MEAN_S:
+        flagged.append(f"mean band wait {mean_w:.1f}s >= {_NFS_WARN_BAND_WAIT_MEAN_S}s")
+    if max_w >= _NFS_WARN_BAND_WAIT_MAX_S:
+        flagged.append(f"max band wait {max_w:.1f}s >= {_NFS_WARN_BAND_WAIT_MAX_S}s")
+    if commit_s >= _NFS_WARN_COMMIT_S:
+        flagged.append(f"txn commit {commit_s:.1f}s >= {_NFS_WARN_COMMIT_S}s")
+    if drain_s >= _NFS_WARN_DRAIN_S:
+        flagged.append(f"write drain {drain_s:.1f}s >= {_NFS_WARN_DRAIN_S}s")
+    if n_failed:
+        flagged.append(f"{n_failed} failed background writes")
+    if not flagged:
+        return
+    msg = (
+        f"[NFS-CONTENTION] stripe slowed by storage backend — "
+        + ", ".join(flagged)
+        + f" | bands={n}, writes={n_writes}, mean_wait={mean_w:.2f}s, "
+          f"max_wait={max_w:.2f}s, commit={commit_s:.2f}s, drain={drain_s:.2f}s"
+    )
+    print(msg)
+    print(msg, file=sys.stderr, flush=True)
+
+
 def assemble_streaming(
     shifts: dict,
     tile_size: tuple,
@@ -1367,6 +1411,12 @@ def assemble_streaming(
             _well_tile_cache, _well_tile_cache_lock,
         ))
 
+    # Track per-band wait times so we can emit an NFS-contention warning at
+    # the end of the stripe if reads are slower than the typical baseline.
+    # Pipelined reads should add ~0s to wall when NFS keeps up; multi-second
+    # waits mean the GPU is idling on the prefetch.
+    _band_wait_times: list = []
+
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
         t_band_start = time.time()
 
@@ -1374,6 +1424,7 @@ def assemble_streaming(
         t_load_start = time.time()
         tile_cache = _load_futures.popleft().result()
         t_load_elapsed = time.time() - t_load_start
+        _band_wait_times.append(t_load_elapsed)
 
         # Keep prefetch pipeline full
         next_prefetch = band_idx + _prefetch_depth
@@ -1572,11 +1623,22 @@ def assemble_streaming(
     # v3-native: tensorstore transaction commit. All X-block writes have
     # staged into the per-position transaction; commit now coalesces them
     # per-shard (one re-encode per shard, instead of one per X-block).
+    commit_elapsed = 0.0
     if hasattr(arr_out, "commit"):
         t_commit_start = time.time()
         arr_out.commit()
-        print(f"  [Txn commit] {time.time() - t_commit_start:.2f}s "
+        commit_elapsed = time.time() - t_commit_start
+        print(f"  [Txn commit] {commit_elapsed:.2f}s "
               f"(coalesced {len(_write_futures)} writes per shard)")
+
+    # NFS-contention summary: typical pheno-2d on uncontended NFS shows
+    # mean per-band wait < 2s and per-stripe commit < 25s. When the NFS
+    # backend is loaded by other tenants (D-state worker, slow Vast/NetApp
+    # responses), waits and commits jump 2-3x. Emit a single line to
+    # stderr when either exceeds threshold so the symptom is searchable
+    # in slurm logs without re-parsing every band line.
+    _nfs_warn(_band_wait_times, commit_elapsed, t_drain_elapsed,
+              len(_write_futures), n_failed)
 
     return arr_out
 
