@@ -2170,10 +2170,22 @@ def stitch(
             - "auto" (default): GPU + Dask uses multiprocess wells, GPU without Dask uses threaded wells, CPU uses parallel Y-bands
             - "wells": Force parallel well processing (Dask multiprocessing if available, else threads)
             - "wells_threads": Force parallel well processing via ThreadPoolExecutor (legacy)
+            - "wells_processes": Force multiprocess wells (spawn)
+            - "shard_stripes": Force shard-stripe multiprocess (recommended for v3-native)
             - "y_bands": Force parallel Y-band processing (joblib)
             - "sequential": No parallelization
         **kwargs: Additional arguments passed to assemble_streaming()
+
+    STITCH_PARALLEL_MODE env var, if set to one of the above values, overrides
+    the parameter — used by production callers that don't take parallel_mode
+    in their own signature (e.g. estimate_and_stitch).
     """
+    # Env-var override so production callers (estimate_and_stitch) can pick
+    # shard_stripes without a signature change.
+    _pm_env = os.environ.get("STITCH_PARALLEL_MODE", "").strip().lower()
+    if _pm_env in ("auto", "wells", "wells_threads", "wells_processes",
+                   "shard_stripes", "y_bands", "sequential"):
+        parallel_mode = _pm_env
 
     # get the shifts and split into a list of lists per well
     all_shifts = read_shifts_biahub(config_path)
