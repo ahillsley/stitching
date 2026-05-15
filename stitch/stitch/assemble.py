@@ -2554,8 +2554,12 @@ def stitch(
                         tx_write = new_tx_write
                     chunks_size = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
                 else:
-                    inner_yx = max(1, ty_band // shard_ratio_yx)
-                    v3_chunks = (1, 1, 1, inner_yx, inner_yx)
+                    # Legacy STITCH_SHARD_RATIO_YX path. Force inner chunks
+                    # to 512x512 to match the v3-native recipe (Gav's PR
+                    # feedback: labels are 512x512 and pyramid levels 1+
+                    # are 512x512, level 0 should be too). Shard outer
+                    # size is still derived from ty_band/shard_ratio_yx.
+                    v3_chunks = (1, 1, 1, 512, 512)
                     v3_shards = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
 
                 # Use iohub create_zeros (it accepts shards_ratio in modern
