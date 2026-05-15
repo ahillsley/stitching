@@ -2983,21 +2983,28 @@ def stitch(
                         final_shape_xy[0], final_shape_xy[1],
                     )
                 from iohub.ngff import TransformationMeta as _TM
+                # In v3-native mode pin level-0 inner chunks to 512x512 to
+                # match the Dask Bands path, convert_v3's recipe, and the
+                # pyramid levels / labels arrays. Stripe-cut boundaries
+                # still align to the absolute shard size below, derived
+                # from chunks_size, so this only changes the on-disk chunk
+                # granularity inside each shard.
+                v3_chunks_for_create = chunks_size
+                if v3_shards_in is not None:
+                    v3_chunks_for_create = (chunks_size[0], chunks_size[1],
+                                            chunks_size[2], 512, 512)
                 create_kwargs = dict(
                     name="0",
                     shape=final_shape,
-                    chunks=chunks_size,
+                    chunks=v3_chunks_for_create,
                     dtype=_resolve_value_dtype(kwargs.get("value_precision_bits", 32)),
                     transform=([_TM(type="scale", scale=scale)] if scale is not None else None),
                 )
                 if v3_shards_in is not None:
-                    wb_y, wb_x = chunks_size[3], chunks_size[4]
-                    rsy = max(1, wb_y // 512); rsx = max(1, wb_x // 512)
-                    create_kwargs["shards_ratio"] = (
-                        v3_shards_in[0], v3_shards_in[1], v3_shards_in[2],
-                        max(1, v3_shards_in[3] // rsy),
-                        max(1, v3_shards_in[4] // rsx),
-                    )
+                    # shards_ratio is the (outer/inner) ratio; with 512x512
+                    # inner chunks the kwarg from outer stitch() applies
+                    # directly (it was computed assuming 512 chunks).
+                    create_kwargs["shards_ratio"] = tuple(v3_shards_in)
                 try:
                     pos.create_zeros(**create_kwargs)
                 except Exception as e:
