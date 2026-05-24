@@ -331,11 +331,22 @@ def _resolve_shift_dtype(shifts: dict, tile_size: tuple, base_bits: int = 32):
 
 
 def get_output_shape(shifts: dict, tile_size: tuple) -> tuple:
-    """Get the output shape of the stitched image from the raw shifts"""
+    """Get the output shape of the stitched image from the raw shifts.
+
+    Uses ``round()`` before ``int()`` so that float-precision noise in the
+    upstream shift solver (e.g. cupy LSMR+IRLS vs scipy L-BFGS-B yielding
+    positions like 25344.99999 vs 25345.00001) does NOT cause the canvas
+    size to jump by ±1 pixel between runs. With plain ``int()`` truncation,
+    such sub-pixel differences in the max-shift tile produced 2-pixel
+    canvas-size jumps and 2-pixel global shifts in downstream
+    bc_stitched outputs (observed 2026-05-24 on ops0154 A/2 stitch:
+    27343×27363 vs 27341×27362 between two solver paths with positions
+    agreeing to 6 decimals — see compare_test_vs_prod investigation).
+    """
 
     x_shifts = [shift[0] for shift in shifts.values()]
     y_shifts = [shift[1] for shift in shifts.values()]
-    max_x = int(xp.max(xp.asarray(x_shifts)))
-    max_y = int(xp.max(xp.asarray(y_shifts)))
+    max_x = int(round(float(xp.max(xp.asarray(x_shifts)))))
+    max_y = int(round(float(xp.max(xp.asarray(y_shifts)))))
 
     return max_x + tile_size[0], max_y + tile_size[1]
