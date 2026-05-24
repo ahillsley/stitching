@@ -2734,10 +2734,15 @@ def stitch(
                 t_end = min(ts[0], final_shape[0])
                 c_end = min(ts[1], final_shape[1])
                 z_end = min(ts[2], final_shape[2])
-                ys = int(shift[0])
-                ye = int(shift[0] + tile_shape[-2])
-                xs = int(shift[1])
-                xe = int(shift[1] + tile_shape[-1])
+                # Round (not truncate) so sub-pixel float noise in the upstream
+                # shift solver doesn't move per-tile placement by ±1 pixel
+                # between runs. See utils.get_output_shape for the same fix at
+                # canvas level. Compute ys/xs first so ye-ys stays exactly
+                # tile_shape (mixed round/truncate would corrupt the invariant).
+                ys = int(round(float(shift[0])))
+                xs = int(round(float(shift[1])))
+                ye = ys + int(tile_shape[-2])
+                xe = xs + int(tile_shape[-1])
                 tile_meta.append((tile_name, t_end, c_end, z_end, ys, ye, xs, xe))
 
             # Pre-identify Y-bands and their contributing tiles
