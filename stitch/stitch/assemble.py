@@ -2293,6 +2293,7 @@ def stitch(
     rot90: int = 0,
     blending_method: Literal["average", "edt"] = "edt",
     parallel_mode: Literal["auto", "wells", "wells_threads", "wells_processes", "shard_stripes", "y_bands", "sequential"] = "auto",
+    t_chunk: Optional[int] = None,
     **kwargs,
 ):
     """Mimic of biahub stitch function
@@ -2313,10 +2314,15 @@ def stitch(
             - "shard_stripes": Force shard-stripe multiprocess (recommended for v3-native)
             - "y_bands": Force parallel Y-band processing (joblib)
             - "sequential": No parallelization
+        t_chunk: Sub-batch the leading band axis into chunks of this many
+            channels, capping per-worker GPU/host peak (see _process_y_band_gpu).
+            Use for deep tensors like ISS (cycles × channels stacked); leave
+            None for track/pheno. Propagated via STITCH_T_CHUNK so it also
+            reaches spawned subprocess workers (env is forwarded, args are not).
         **kwargs: Additional arguments passed to assemble_streaming()
 
-    STITCH_PARALLEL_MODE env var, if set to one of the above values, overrides
-    the parameter — used by production callers that don't take parallel_mode
+    The STITCH_PARALLEL_MODE / STITCH_T_CHUNK env vars override their
+    respective parameters — used by production callers that don't take them
     in their own signature (e.g. estimate_and_stitch).
     """
     # Env-var override so production callers (estimate_and_stitch) can pick
@@ -2325,6 +2331,11 @@ def stitch(
     if _pm_env in ("auto", "wells", "wells_threads", "wells_processes",
                    "shard_stripes", "y_bands", "sequential"):
         parallel_mode = _pm_env
+
+    # Publish t_chunk to the env the deep band code and subprocess workers
+    # read from. Env var (if already set) wins, matching parallel_mode.
+    if not os.environ.get("STITCH_T_CHUNK", "").strip() and t_chunk is not None:
+        os.environ["STITCH_T_CHUNK"] = str(int(t_chunk))
 
     # get the shifts and split into a list of lists per well
     all_shifts = read_shifts_biahub(config_path)
