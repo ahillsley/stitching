@@ -1748,6 +1748,26 @@ def _process_well_subprocess_entry(args):
         return well_id, False
 
 
+def _auto_workers_per_gpu(peak_band_bytes: int, per_gpu_gb: float) -> tuple:
+    """Workers that fit one GPU, sized to the largest per-band buffer.
+
+    Per-worker peak ≈ 4× the largest band buffer (numer + denom + norm +
+    working) + 4 GB headroom (cuda context, cupy pool, prefetched tiles).
+    ``STITCH_WORKERS_PER_GPU`` overrides the derived count. Shared by the Dask
+    Bands and shard-stripe paths so both size identically.
+    """
+    peak_gb_per_worker = (4 * peak_band_bytes) / 1e9 + 4.0
+    workers_per_gpu = max(1, int(per_gpu_gb // peak_gb_per_worker))
+    override = os.environ.get("STITCH_WORKERS_PER_GPU", "")
+    try:
+        override_n = int(override) if override else 0
+    except ValueError:
+        override_n = 0
+    if override_n > 0:
+        workers_per_gpu = override_n
+    return workers_per_gpu, peak_gb_per_worker
+
+
 def _process_stripe_subprocess_entry(args):
     """Module-level entry for ``parallel_mode='shard_stripes'``.
 
@@ -2717,24 +2737,8 @@ def stitch(
                 array_bytes = t_c_z * band_h * band_w * itemsize
                 if array_bytes > peak_band_bytes:
                     peak_band_bytes = array_bytes
-            # Per-worker peak: numer + denom + norm + block/working ≈ 4×.
-            # Add 4 GB headroom for cuda context, cupy memory-pool overhead,
-            # and the prefetched-tile cache.
-            peak_gb_per_worker = (4 * peak_band_bytes) / 1e9 + 4.0
-            workers_per_gpu = max(1, int(per_gpu_gb // peak_gb_per_worker))
-            # STITCH_WORKERS_PER_GPU overrides the auto-derived count — useful
-            # when you want a small number of workers fed by deep read prefetch
-            # / large write window (saturating GPU with less host-RAM
-            # contention than packing more workers).
-            override = os.environ.get("STITCH_WORKERS_PER_GPU", "")
-            try:
-                override_n = int(override) if override else 0
-            except ValueError:
-                override_n = 0
-            if override_n > 0:
-                print(f"[Dask Bands] STITCH_WORKERS_PER_GPU override: "
-                      f"{workers_per_gpu} → {override_n}")
-                workers_per_gpu = override_n
+            workers_per_gpu, peak_gb_per_worker = _auto_workers_per_gpu(
+                peak_band_bytes, per_gpu_gb)
             n_dask_workers = min(workers_per_gpu * n_gpus, len(work_queue))
             print(f"[Dask Bands] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each, "
                   f"peak~{peak_gb_per_worker:.1f}GB/worker → "
@@ -2964,14 +2968,9 @@ def stitch(
         # tile reads partition cleanly → much less NFS contention than
         # whole-well multiprocess; memory per worker scales with stripe
         # size (smaller buffers per worker = fits more workers in RAM).
-        import multiprocessing as _mp
-        from concurrent.futures import ProcessPoolExecutor as _PPE
-
         stripes_per_well = max(1, int(os.environ.get("STITCH_STRIPES_PER_WELL", "4")))
-        max_workers_env = int(os.environ.get(
-            "STITCH_STRIPE_WORKERS",
-            str(min(num_wells * stripes_per_well, 6))
-        ))
+        # Worker count is sized below to per-GPU VRAM × n_gpus (shared with the
+        # Dask Bands path) and run across all GPUs via MultiGPUCluster.
         # Pre-create plate, positions, AND output arrays in the parent so
         # workers don't race on iohub writes. Workers open the array as
         # raw zarr.
@@ -3027,8 +3026,11 @@ def stitch(
 
         env_to_forward = {
             k: v for k, v in os.environ.items()
-            if k.startswith("STITCH_") or k.startswith("CUDA_") or k.startswith("OMP_")
-            or k.startswith("MKL_") or k.startswith("OPENBLAS_") or k.startswith("NUMEXPR_")
+            if (k.startswith("STITCH_") or k.startswith("CUDA_") or k.startswith("OMP_")
+                or k.startswith("MKL_") or k.startswith("OPENBLAS_") or k.startswith("NUMEXPR_"))
+            # MultiGPUCluster pins each worker's GPU before spawn; don't let the
+            # parent's CUDA_VISIBLE_DEVICES (all GPUs) override that pin.
+            and k != "CUDA_VISIBLE_DEVICES"
         }
 
         # Build (well, stripe) tasks. CRITICAL: stripe boundaries must
@@ -3047,10 +3049,25 @@ def stitch(
         else:
             shard_cell_y = ty_band
         all_tasks = []
+        # Track the largest single-Y-band GPU buffer to size workers to VRAM
+        # below. Band height = the value assemble_streaming steps by
+        # (divide_tile_size = target_chunks_yx), full stitched width, T·C·Z.
+        _T, _C, _Z = int(tile_shape[0]), int(tile_shape[1]), int(tile_shape[2])
+        _itemsize = int(np.dtype(_resolve_value_dtype(
+            kwargs.get("value_precision_bits", 32))).itemsize)
+        _t_chunk = int(os.environ.get("STITCH_T_CHUNK", "0") or "0")
+        _band_h = int(kwargs.get("target_chunks_yx", (1024, 1024))[0])
+        peak_band_bytes = 0
         for well_id in well_ids:
             well_shifts = grouped_shifts[well_id]
             final_shape_xy = get_output_shape(well_shifts, tile_shape[-2:])
             total_y_well = int(final_shape_xy[0])
+            _eff_t = min(_t_chunk, _T) if _t_chunk > 0 else _T
+            peak_band_bytes = max(
+                peak_band_bytes,
+                _eff_t * _C * _Z * min(_band_h, total_y_well)
+                * int(final_shape_xy[1]) * _itemsize,
+            )
             # Cap stripes at the number of shard rows available
             n_shard_rows = max(1, (total_y_well + shard_cell_y - 1) // shard_cell_y)
             n_stripes_eff = min(stripes_per_well, n_shard_rows)
@@ -3079,19 +3096,53 @@ def stitch(
                     kwargs, blending_method, chunks_size, scale, env_to_forward,
                 ))
 
-        print(f"[Stripes] Dispatching {len(all_tasks)} tasks across {max_workers_env} workers "
-              f"({stripes_per_well} stripes/well × {num_wells} wells)")
+        # Size workers to one GPU's VRAM and run that many PER GPU across all
+        # GPUs — the same VRAM-aware multi-GPU strategy as the Dask Bands path,
+        # via the shared MultiGPUCluster (pins CUDA_VISIBLE_DEVICES per worker
+        # before spawn, so the whole worker process binds to one card). This
+        # restores the multi-GPU capability the v2→v3 default switch dropped
+        # when pheno moved from Dask wells to shard_stripes.
+        from ops_utils.hpc.gpu_utils import _setup_gpu_environment
+        from ops_utils.hpc.parallel_utils import MultiGPUCluster
 
-        ctx = _mp.get_context("spawn")
+        available_gpus = _setup_gpu_environment()
+        n_gpus = len(available_gpus)
         completed = []
         failed = []
-        with _PPE(max_workers=max_workers_env, mp_context=ctx) as ex:
-            for result in ex.map(_process_stripe_subprocess_entry, all_tasks):
-                well_id, y_start, y_end, ok = result
-                if ok:
-                    completed.append((well_id, y_start, y_end))
-                else:
-                    failed.append((well_id, y_start, y_end))
+
+        if _USING_CUPY and n_gpus > 0:
+            import math as _math
+            per_gpu_gb = xp.cuda.Device(0).mem_info[1] / 1e9
+            vram_cap, peak_gb = _auto_workers_per_gpu(peak_band_bytes, per_gpu_gb)
+            # Spread the proven worker count across GPUs; cap per-GPU by VRAM so
+            # a wide canvas can't over-pack a card. Stitching is NFS-bound, so
+            # MORE workers don't speed it up — they oversubscribe CPU/NFS and add
+            # cluster-startup overhead. So target the old single-GPU concurrency
+            # (≤6) split across GPUs rather than ballooning to full VRAM capacity.
+            desired_total = min(len(all_tasks), num_wells * stripes_per_well, 6)
+            workers_per_gpu = max(1, min(vram_cap, _math.ceil(desired_total / n_gpus)))
+            total_workers = workers_per_gpu * n_gpus
+            # Workers size their NFS/CPU thread pools from STITCH_STRIPE_WORKERS;
+            # propagate the real concurrency (env_to_forward is shared by the
+            # already-built task tuples, so this reaches every worker).
+            env_to_forward["STITCH_STRIPE_WORKERS"] = str(total_workers)
+            print(f"[Stripes] {n_gpus} GPU(s), {per_gpu_gb:.0f}GB each, "
+                  f"peak~{peak_gb:.1f}GB/worker (VRAM-cap {vram_cap}/gpu) → "
+                  f"{workers_per_gpu}/gpu × {n_gpus} = {total_workers} workers | "
+                  f"{len(all_tasks)} tasks ({stripes_per_well} stripes/well × {num_wells} wells)")
+            multi_cluster = MultiGPUCluster(available_gpus, workers_per_gpu, memory_limit=0)
+            try:
+                for fut in multi_cluster.map(_process_stripe_subprocess_entry, all_tasks):
+                    well_id, y_start, y_end, ok = fut.result()
+                    (completed if ok else failed).append((well_id, y_start, y_end))
+            finally:
+                multi_cluster.close()
+        else:
+            # No GPU (rare for shard_stripes): process sequentially in-process.
+            print(f"[Stripes] No GPU — processing {len(all_tasks)} tasks sequentially")
+            for task in all_tasks:
+                well_id, y_start, y_end, ok = _process_stripe_subprocess_entry(task)
+                (completed if ok else failed).append((well_id, y_start, y_end))
 
         print(f"[Stripes] Completed {len(completed)}/{len(all_tasks)} tasks")
         if failed:
