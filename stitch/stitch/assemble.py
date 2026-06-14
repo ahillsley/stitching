@@ -2314,6 +2314,7 @@ def stitch(
     blending_method: Literal["average", "edt"] = "edt",
     parallel_mode: Literal["auto", "wells", "wells_threads", "wells_processes", "shard_stripes", "y_bands", "sequential"] = "auto",
     t_chunk: Optional[int] = None,
+    force_yx_scale: Optional[Tuple[float, float]] = None,
     **kwargs,
 ):
     """Mimic of biahub stitch function
@@ -2378,6 +2379,12 @@ def stitch(
     channel_names = [c["label"] for c in pos_attrs["omero"]["channels"]]
     scale_transforms = pos_attrs.get("multiscales", [{}])[0].get("datasets", [{}])[0].get("coordinateTransformations", [])
     scale = tuple(scale_transforms[0]["scale"]) if scale_transforms and scale_transforms[0].get("type") == "scale" else None
+    if force_yx_scale is not None and scale is not None:
+        # Override the last two dims (Y, X) of the input scale. Used by
+        # ops_stitch.stitch for pheno where the upstream input store
+        # mis-declares native YX as 0.65 µm/px instead of 0.325.
+        scale = tuple(scale[:-2]) + (float(force_yx_scale[0]), float(force_yx_scale[1]))
+        print(f"  [scale override] forced YX scale to {scale[-2:]} (was {scale_transforms[0]['scale'][-2:]})")
     with open(input_store_p / first_pos_key / "0" / ".zarray") as f:
         arr_meta = json.load(f)
     tile_shape = tuple(arr_meta["shape"])
