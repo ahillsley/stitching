@@ -827,18 +827,18 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
 
 
 def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
-                           y0, y1, tx, total_x, _write_executor, _write_futures):
+                           y0, y1, tx, total_x, _write_executor, _write_futures,
+                           compute_done_event=None):
     """Transfer GPU result to CPU on a dedicated stream, then submit zarr writes.
 
-    Runs in a background thread so the main thread can start the next band's
-    GPU compute while this D2H transfer is in progress.  The transfer_stream
-    ensures the DMA engine handles the copy independently of the compute stream.
+    ``compute_done_event`` is recorded on the compute (default) stream right
+    after the divide/nan_to_num kernels were enqueued; transfer_stream is
+    non_blocking, so without an explicit wait it would race the still-pending
+    writes to ``norm_gpu`` and surface as Phase2D stripes at band starts.
     """
     with transfer_stream:
-        # _to_numpy handles both cupy arrays (DMA via the active stream)
-        # and host numpy arrays (no-op view) — the latter occurs when
-        # _process_y_band_gpu took its T-chunked branch which already
-        # produced a host accumulator.
+        if compute_done_event is not None:
+            transfer_stream.wait_event(compute_done_event)
         norm_cpu = _to_numpy(norm_gpu)
     del norm_gpu
     # See _maybe_free_pool: pool blocks kept for next band's alloc by default.
@@ -1458,12 +1458,20 @@ def assemble_streaming(
             if _prev_d2h_future is not None:
                 _prev_d2h_future.result()
 
+            # Record an event on the compute stream so the non_blocking
+            # transfer_stream waits for the divide/nan_to_num writes to
+            # norm_gpu to land before the D2H launches. Without this the
+            # D2H reads partial buffer state (Phase2D stripes at band starts).
+            _compute_done_event = xp.cuda.Event(disable_timing=True)
+            _compute_done_event.record()
+
             # Submit D2H + write for current band in background thread.
             # GPU is free to process next band while DMA engine handles the transfer.
             _prev_d2h_future = _d2h_executor.submit(
                 _d2h_and_submit_writes, norm_gpu, _transfer_stream,
                 arr_out, final_shape, y0, y1, tx, total_x,
                 _write_executor, _write_futures,
+                _compute_done_event,
             )
 
             # See _maybe_free_pool: pool blocks kept for next band's alloc
