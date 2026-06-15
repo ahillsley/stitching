@@ -1465,7 +1465,8 @@ def stitch(
 
     # initialize output zarr store
     output_store = open_ome_zarr(
-        output_store_path, layout="hcs", mode="w-", channel_names=channel_names
+        output_store_path, layout="hcs", mode="w-", channel_names=channel_names,
+        version=ngff_version
     )
     print("output store created")
 
@@ -1873,6 +1874,7 @@ def estimate_stitch(
     use_clahe: bool = False,
     clahe_clip_limit: float = 0.02,
     verbose: bool = False,
+    version: str = "0.4",
 ):
     """Mimic of Biahub estimate stitch function
 
@@ -1898,7 +1900,7 @@ def estimate_stitch(
         print(f"  limit_positions={limit_positions}")
         print(f"  x_guess={x_guess}")
 
-    store = open_ome_zarr(input_store_path)
+    store = open_ome_zarr(input_store_path, version=version)
     if limit_positions is not None and int(limit_positions) > 0:
         print(f"[assemble.estimate_stitch] DEBUG MODE: Limiting to {limit_positions} positions")
     else:
