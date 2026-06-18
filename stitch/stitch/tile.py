@@ -246,26 +246,33 @@ def register_translation_gpu(image_a, image_b, upsample_factor=10):
 
 
 def offset(
-    image_a: np.array, image_b: np.array, relation: tuple, overlap: int
+    image_a: np.array, image_b: np.array, relation: tuple, overlap
 ) -> "TranslationRegistrationModel":
     """
-    overlap: estimate of the # pixels seen in both images
+    overlap: estimate of the # pixels seen in both images. Either a single int
+        (same overlap on both axes) or a tuple ``(overlap_x, overlap_y)`` —
+        ``overlap_x`` sizes the X-axis ROI (column neighbors), ``overlap_y`` the
+        Y-axis ROI (row neighbors).
     """
+    if isinstance(overlap, (tuple, list)):
+        ov_x, ov_y = int(overlap[0]), int(overlap[1])
+    else:
+        ov_x = ov_y = int(overlap)
     shape = image_a.shape
     # TODO: have this load only a small fraction of the entire image
     if relation[0] == -1:
         # tile_b is to the right of tile_a
-        roi_a = image_a[:, -overlap:]
-        roi_b = image_b[:, :overlap]
-        corr_x = shape[-2] - overlap
+        roi_a = image_a[:, -ov_x:]
+        roi_b = image_b[:, :ov_x]
+        corr_x = shape[-1] - ov_x  # X pitch from tile WIDTH (shape[-1])
         corr_y = 0
 
     if relation[1] == -1:
         # tile_b is below tile_a
-        roi_a = image_a[-overlap:, :]
-        roi_b = image_b[:overlap, :]
+        roi_a = image_a[-ov_y:, :]
+        roi_b = image_b[:ov_y, :]
         corr_x = 0
-        corr_y = shape[-1] - overlap
+        corr_y = shape[-2] - ov_y  # Y pitch from tile HEIGHT (shape[-2])
 
     # phase images are centered at 0, shift to make them all positive
     roi_a_min = xp.min(roi_a)

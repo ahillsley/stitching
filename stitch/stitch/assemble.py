@@ -1446,6 +1446,13 @@ def stitch(
             arr_meta = json.load(f)
         tile_shape = tuple(arr_meta["shape"])
         chunks_size = tuple(arr_meta["chunks"])
+    # rot90 swaps the tile's Y/X dims. augment_tile rotates the pixel data at
+    # load time, so every geometry quantity derived from the stored tile shape
+    # (output canvas via get_output_shape, tile placement, and the EDT blend
+    # weights) must use the post-rotation shape. Without this, non-square tiles
+    # with an odd rot90 produce a weights/data broadcast mismatch when blending.
+    if rot90 % 2:
+        tile_shape = tile_shape[:-2] + (tile_shape[-1], tile_shape[-2])
     # Optional override for output chunking to improve viewer (dask/napari) responsiveness
     # Accept either full 5D "target_chunks" or YX-only via "target_chunks_yx"
     target_chunks = kwargs.get("target_chunks")
