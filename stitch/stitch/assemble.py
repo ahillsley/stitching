@@ -2385,6 +2385,13 @@ def stitch(
     input_store_p = Path(input_store_path)
     first_pos_key = next(iter(all_shifts.keys()))  # e.g. "A/1/002026"
     ngff_version = kwargs.get("ngff_version", "0.4")
+    # Validate once here so every `if ngff_version == "0.5": ... else: ...` block
+    # below is provably the 0.4 path in its `else` (an unexpected version fails
+    # loudly rather than silently taking the 0.4 branch).
+    if ngff_version not in ("0.4", "0.5"):
+        raise ValueError(
+            f"unsupported ngff_version {ngff_version!r}; expected '0.4' or '0.5'"
+        )
     if ngff_version == "0.5":
         with open(input_store_p / first_pos_key / "zarr.json") as f:
             raw = json.load(f)
