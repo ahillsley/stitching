@@ -310,11 +310,11 @@ def _process_edge_pair(key, pos, tile_cache, overlap):
     return key, edge_model, confidence_entry
 
 
-def linsolve_gpu_lsqr(a_sparse, y, x0, tolerance=1e-5):
+def linsolve_gpu_lsqr(a_sparse, y, x0, tolerance=1e-5, weights=None):
     """
     GPU-accelerated L2 least squares solver using CuPy's LSMR.
 
-    Minimizes: ||Ax - y||₂
+    Minimizes: ||Ax - y||₂ (or, with ``weights``, the weighted ||diag(√w)(Ax-y)||₂)
 
     Args:
         a_sparse: scipy sparse CSR matrix (n_edges × n_tiles)
@@ -339,6 +339,13 @@ def linsolve_gpu_lsqr(a_sparse, y, x0, tolerance=1e-5):
     a_gpu = gpu_sparse.csr_matrix(a_sparse, dtype=xp.float64)
     y_gpu = xp.asarray(y, dtype=xp.float64)
     x0_gpu = xp.asarray(x0, dtype=xp.float64)
+
+    # Optional per-row confidence weighting: min ||diag(√w)(Ax - y)||₂. LSMR has no
+    # native row weights, so pre-scale each row of A and y by √w.
+    if weights is not None:
+        w_sqrt = xp.sqrt(xp.asarray(weights, dtype=xp.float64))
+        a_gpu = gpu_sparse.diags(w_sqrt, format="csr") @ a_gpu
+        y_gpu = w_sqrt * y_gpu
 
     # Solve using LSMR (iterative solver optimized for sparse systems)
     # Note: Use lsmr not lsqr - lsmr supports x0, atol, btol parameters
@@ -367,7 +374,7 @@ def linsolve_gpu_lsqr(a_sparse, y, x0, tolerance=1e-5):
     return x_cpu
 
 
-def linsolve_gpu_irls_l1(a_sparse, y, x0, tolerance=1e-5, max_iter=20, outer_tolerance=1e-3, min_iter=5):
+def linsolve_gpu_irls_l1(a_sparse, y, x0, tolerance=1e-5, max_iter=20, outer_tolerance=1e-3, min_iter=5, conf_weights=None):
     """
     GPU-accelerated L1 minimization using Iteratively Reweighted Least Squares (IRLS).
 
@@ -408,6 +415,8 @@ def linsolve_gpu_irls_l1(a_sparse, y, x0, tolerance=1e-5, max_iter=20, outer_tol
     a_gpu = gpu_sparse.csr_matrix(a_sparse, dtype=xp.float64)
     y_gpu = xp.asarray(y, dtype=xp.float64)
     x = xp.asarray(x0, dtype=xp.float64)
+    # Optional per-edge confidence weight (folded into the IRLS reweight below).
+    _cw = None if conf_weights is None else xp.asarray(conf_weights, dtype=xp.float64)
 
     # Adaptive epsilon based on median residual
     # Start with initial residuals to estimate scale
@@ -467,6 +476,10 @@ def linsolve_gpu_irls_l1(a_sparse, y, x0, tolerance=1e-5, max_iter=20, outer_tol
 
         # Compute weights: w_i = 1 / (|r_i| + eps)
         weights = 1.0 / (xp.abs(residuals) + eps)
+        if _cw is not None:
+            # Fold in per-edge confidence: w_total = w_confidence · w_IRLS, so the
+            # iteration approximates min Σ w_confidence·|r| (confidence-weighted L1).
+            weights = weights * _cw
 
         # Create diagonal weight matrix: W = diag(sqrt(weights))
         # For weighted LS: min ||W^(1/2)(Ax - y)||₂ = min ||W_sqrt*A*x - W_sqrt*y||₂
@@ -585,14 +598,43 @@ def pairwise_shifts(
     return edge_list, confidence_dict
 
 
+WEIGHT_EPS = 1e-3  # weight floor: keeps every edge nonzero so no tile is left
+                   # under-constrained (the solve has no Tikhonov term).
+
+
+def _edge_weight(conf: float, mode: str) -> float:
+    """Map a phase-correlation confidence (0..1) to a global-solve weight.
+
+    mode: 'linear' (w=conf), 'squared' (w=conf**2), or 'threshold:<cutoff>'
+    (w=conf if conf>=cutoff else the floor). Results are clamped to >= WEIGHT_EPS.
+    """
+    if mode == "linear":
+        return max(conf, WEIGHT_EPS)
+    if mode == "squared":
+        return max(conf, WEIGHT_EPS) ** 2
+    if mode.startswith("threshold:"):
+        cutoff = float(mode.split(":", 1)[1])
+        return conf if conf >= cutoff else WEIGHT_EPS
+    raise ValueError(f"unknown confidence weighting mode: {mode!r}")
+
+
 def optimal_positions(
     edge_list: List,
     tile_lut: Dict,
     well: str,
     tile_size: tuple,
     initial_guess: dict = None,
+    confidence_by_edge: dict = None,
+    weighting: str = None,
 ) -> Dict:
-    """ """
+    """Solve for globally optimal tile positions from pairwise edge shifts.
+
+    When ``weighting`` is set (and ``confidence_by_edge`` is provided), each edge
+    equation is weighted by ``_edge_weight(confidence, weighting)`` so low-confidence
+    seams pull less on the global fit. ``confidence_by_edge`` maps
+    ``frozenset({tile_a_name, tile_b_name}) -> confidence``. Default (None) is the
+    original equal-weight solve, byte-for-byte unchanged.
+    """
     # Use float64 for better numerical accuracy to match CPU solver
     y_i = np.zeros(len(edge_list) + 1, dtype=np.float64)
     y_j = np.zeros(len(edge_list) + 1, dtype=np.float64)
@@ -633,6 +675,27 @@ def optimal_positions(
     alpha_reg = 0
     maxiter = 1e8
 
+    # Optional confidence weighting. Build a per-row weight vector aligned to the
+    # matrix rows (one per edge, plus the anchor row kept at weight 1). Edges are
+    # matched to their confidence by tile-name pair — edge_list order is not
+    # meaningful (pairwise_shifts appends in as_completed order).
+    w = None
+    if weighting is not None and confidence_by_edge is not None:
+        w = np.ones(len(edge_list) + 1, dtype=np.float64)  # last row = anchor, w=1
+        n_missing = 0
+        for c, e in enumerate(edge_list):
+            conf = confidence_by_edge.get(frozenset({e.tile_a, e.tile_b}))
+            if conf is None:
+                w[c] = WEIGHT_EPS  # edge not scored -> minimal influence
+                n_missing += 1
+            else:
+                w[c] = _edge_weight(float(conf), weighting)
+        print(
+            f"[optimal_positions] confidence weighting='{weighting}': "
+            f"{len(edge_list) - n_missing}/{len(edge_list)} edges scored, "
+            f"w range {w[:-1].min():.3g}..{w[:-1].max():.3g}"
+        )
+
     # Try GPU-accelerated solvers first, fall back to CPU if unavailable
     USE_GPU_FOR_OPTIMIZATION = True  # GPU now enabled
 
@@ -641,8 +704,8 @@ def optimal_positions(
         try:
             # Method 1: Fast L2 solution (LSMR)
             print("  Method 1: GPU LSMR (L2 norm)")
-            opt_i_lsqr = linsolve_gpu_lsqr(a, y_i, i_guess, tolerance=tolerance)
-            opt_j_lsqr = linsolve_gpu_lsqr(a, y_j, j_guess, tolerance=tolerance)
+            opt_i_lsqr = linsolve_gpu_lsqr(a, y_i, i_guess, tolerance=tolerance, weights=w)
+            opt_j_lsqr = linsolve_gpu_lsqr(a, y_j, j_guess, tolerance=tolerance, weights=w)
 
             # Method 2: L1 solution (IRLS) - cold start from grid guess to find true L1 minimum
             # Note: Warm-starting from L2 caused premature convergence without reaching L1 optimum
@@ -652,14 +715,16 @@ def optimal_positions(
                 tolerance=tolerance,       # Inner LSMR tolerance: 1e-5
                 outer_tolerance=1e-3,      # Outer IRLS tolerance: 1e-3 (0.1% change in L1 objective)
                 max_iter=200,              # Optimal: best performance (176s) with excellent convergence
-                min_iter=8                 # Increased from 5 to ensure sufficient iterations
+                min_iter=8,                # Increased from 5 to ensure sufficient iterations
+                conf_weights=w,
             )
             opt_j_irls = linsolve_gpu_irls_l1(
                 a, y_j, j_guess,           # Cold start from grid guess
                 tolerance=tolerance,
                 outer_tolerance=1e-3,
                 max_iter=200,              # Optimal: best performance (176s) with excellent convergence
-                min_iter=8
+                min_iter=8,
+                conf_weights=w,
             )
 
             # Compute difference between L1 and L2 solutions
@@ -696,9 +761,17 @@ def optimal_positions(
         # It stops after only ~7 function evaluations with 0% improvement
         # scipy.optimize.minimize with L-BFGS-B is much better suited for this problem
         print("optimizing positions (CPU with scipy L-BFGS-B)")
+        # Confidence weighting (external dexp linsolve has no row weights): pre-scale
+        # the system rows by √w so low-confidence edges contribute less.
+        a_cpu, y_i_cpu, y_j_cpu = a, y_i, y_j
+        if w is not None:
+            w_sqrt = np.sqrt(w)
+            a_cpu = scipy.sparse.diags(w_sqrt) @ a
+            y_i_cpu = w_sqrt * y_i
+            y_j_cpu = w_sqrt * y_j
         opt_i = linsolve(
-            a,
-            y_i,
+            a_cpu,
+            y_i_cpu,
             tolerance=tolerance,
             order_error=order_error,
             order_reg=order_reg,
@@ -707,8 +780,8 @@ def optimal_positions(
             maxiter=maxiter,
         )
         opt_j = linsolve(
-            a,
-            y_j,
+            a_cpu,
+            y_j_cpu,
             tolerance=tolerance,
             order_error=order_error,
             order_reg=order_reg,

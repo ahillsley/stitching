@@ -1882,6 +1882,7 @@ def estimate_stitch(
     clahe_clip_limit: float = 0.02,
     verbose: bool = False,
     version: str = "0.4",
+    confidence_weighting: Optional[str] = None,
 ):
     """Mimic of Biahub estimate stitch function
 
@@ -2010,7 +2011,20 @@ def estimate_stitch(
             verbose=verbose,
         )
 
-        opt_shift_dict = optimal_positions(edge_list, tile_lut, well_id, tile_size, x_guess)
+        # Confidence lookup keyed by tile-name pair (matches Edge.tile_a/.tile_b
+        # and connect.pos_to_name's "%03d%03d" format) for the weighted solve.
+        conf_by_edge = None
+        if confidence_weighting is not None:
+            conf_by_edge = {
+                frozenset({f"{int(pa[0]):03d}{int(pa[1]):03d}",
+                           f"{int(pb[0]):03d}{int(pb[1]):03d}"}): float(sc)
+                for pa, pb, sc in confidence_dict.values()
+            }
+
+        opt_shift_dict = optimal_positions(
+            edge_list, tile_lut, well_id, tile_size, x_guess,
+            confidence_by_edge=conf_by_edge, weighting=confidence_weighting,
+        )
 
         return well_id, opt_shift_dict, confidence_dict
 
