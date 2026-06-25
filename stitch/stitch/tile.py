@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import numpy as np
 from stitch import connect
 from collections import OrderedDict
@@ -28,6 +29,15 @@ except ModuleNotFoundError:
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
 
+
+def _device_print(msg: str) -> None:
+    """Device selection is only informative on compute nodes (where a GPU
+    fallback signals a real problem). Stay silent on the login node — no
+    SLURM_JOB_ID — where these imports are pure orchestration noise."""
+    if os.environ.get("SLURM_JOB_ID"):
+        print(msg)
+
+
 # Try to use CuPy for GPU-accelerated registration
 try:
     import cupy as xp
@@ -36,10 +46,10 @@ try:
     try:
         _ = xp.array([1.0])  # Test GPU access
         _USING_CUPY = True
-        print("[tile.py] Using CuPy (GPU) for registration")
+        _device_print("[tile.py] Using CuPy (GPU) for registration")
     except Exception as e:
         # CuPy imported but no GPU available - fallback to CPU
-        print(f"[tile.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+        _device_print(f"[tile.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
         import numpy as xp
         from scipy import ndimage as cundi
         _USING_CUPY = False
@@ -47,7 +57,7 @@ except (ModuleNotFoundError, ImportError):
     import numpy as xp
     from scipy import ndimage as cundi
     _USING_CUPY = False
-    print("[tile.py] Using NumPy (CPU) for registration")
+    _device_print("[tile.py] Using NumPy (CPU) for registration")
 
 
 class LimitedSizeDict(OrderedDict):

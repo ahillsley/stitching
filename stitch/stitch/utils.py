@@ -14,6 +14,15 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Tuple
 
+
+def _device_print(msg: str) -> None:
+    """Device selection is only informative on compute nodes (where a GPU
+    fallback signals a real problem). Stay silent on the login node — no
+    SLURM_JOB_ID — where these imports are pure orchestration noise."""
+    if os.environ.get("SLURM_JOB_ID"):
+        print(msg)
+
+
 # Try to use CuPy for GPU acceleration, fall back to NumPy
 try:
     import cupy as xp
@@ -22,10 +31,10 @@ try:
     try:
         _ = xp.array([1.0])  # Test GPU access
         _USING_CUPY = True
-        print("[utils.py] Using CuPy (GPU) for array operations")
+        _device_print("[utils.py] Using CuPy (GPU) for array operations")
     except Exception as e:
         # CuPy imported but no GPU available - fallback to CPU
-        print(f"[utils.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+        _device_print(f"[utils.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
         import numpy as xp
         from scipy import ndimage as cundi
         _USING_CUPY = False
@@ -33,7 +42,7 @@ except (ModuleNotFoundError, ImportError):
     import numpy as xp
     from scipy import ndimage as cundi
     _USING_CUPY = False
-    print("[utils.py] Using NumPy (CPU) for array operations")
+    _device_print("[utils.py] Using NumPy (CPU) for array operations")
 
 
 # Cache for EDT-based blending weight maps to avoid recomputation per tile size/exponent
