@@ -11,11 +11,20 @@ import scipy
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from dexp.processing.registration.model.translation_registration_model import (
-    TranslationRegistrationModel,
-)
-from dexp.processing.registration import translation_nd as dexp_reg
-from dexp.processing.utils.linear_solver import linsolve
+# dexp pulls cupy (GPU); it's optional at IMPORT so this module loads in dexp-less
+# envs (e.g. downstream CI that imports the stitch package without GPU deps). The
+# names below are used only inside the GPU registration/solver functions
+# (register_translation_gpu, offset, optimal_positions), which run where dexp is present.
+try:
+    from dexp.processing.registration.model.translation_registration_model import (
+        TranslationRegistrationModel,
+    )
+    from dexp.processing.registration import translation_nd as dexp_reg
+    from dexp.processing.utils.linear_solver import linsolve
+except ModuleNotFoundError:
+    TranslationRegistrationModel = None
+    dexp_reg = None
+    linsolve = None
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
 
