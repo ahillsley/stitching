@@ -240,6 +240,139 @@ def _process_x_block_gpu(x0, x1, y0, y1, y_tiles, tile_cache, final_shape, dtype
         return norm_cpu
 
 
+def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape,
+                               dtype_val, out_dtype, use_edt, tile_weights, tx,
+                               profile=False, timings_out=None):
+    """X-block-scoped GPU band processor (generator).
+
+    Allocates a small ``numer/denom`` per X-block (~34 MB for typical LiveScreen
+    chunk sizes) instead of one giant band-wide buffer (~19 GB for band_h=1024,
+    total_x=1.16 M). Peak GPU footprint drops ~500× — enables multiple bands to
+    share a single GPU (via CUDA streams) and unblocks multi-GPU dispatch.
+
+    Yields ``(x0, x1, norm_gpu_x)`` for each X-block that has any tile coverage.
+    ``norm_gpu_x`` is already cast to ``out_dtype`` (the array's output type),
+    so downstream D2H transfers half the payload for uint16 outputs.
+
+    Args:
+        y0, y1: element-space Y range of this band.
+        total_x: full canvas width (used to enumerate X-block boundaries).
+        y_tiles: iterable of tile-meta tuples ``(name, T, C, Z, ys, ye, xs, xe)``.
+        tile_cache: mapping name -> (tile_array, T, C, Z, ys, ye, xs, xe).
+        dtype_val: accumulation dtype (float32 typical).
+        out_dtype: output array's on-disk dtype (uint16 for LiveScreen).
+        use_edt: EDT blending flag.
+        tile_weights: precomputed EDT weight kernel.
+        tx: X-block width (must be chunk-aligned for downstream direct writes).
+    """
+    band_h = y1 - y0
+    x_blocks = list(range(0, total_x, tx))
+    # Precompute per-X-block tile intersections so we skip empty x-blocks and
+    # avoid re-scanning y_tiles from scratch per X.
+    tiles_by_xblock = {x0: [] for x0 in x_blocks}
+    for tm in y_tiles:
+        name, t_end, c_end, z_end, ys, ye, xs, xe = tm
+        # Skip tiles that miss this band's Y range entirely
+        if ye <= y0 or ys >= y1:
+            continue
+        for x0 in x_blocks:
+            x1 = min(total_x, x0 + tx)
+            if xe > x0 and xs < x1:
+                tiles_by_xblock[x0].append(tm)
+
+    t_accum_total = 0.0
+    n_tiles_hit_total = 0
+    for x0 in x_blocks:
+        x1 = min(total_x, x0 + tx)
+        x_tiles = tiles_by_xblock[x0]
+        if not x_tiles:
+            continue
+
+        if profile:
+            xp.cuda.Device().synchronize()
+            t_a = time.time()
+
+        numer = xp.zeros(
+            (final_shape[0], final_shape[1], final_shape[2], band_h, x1 - x0),
+            dtype=dtype_val,
+        )
+        denom = xp.zeros_like(numer, dtype=dtype_val)
+
+        for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in x_tiles:
+            iy0 = max(y0, ys)
+            iy1 = min(y1, ye)
+            ix0 = max(x0, xs)
+            ix1 = min(x1, xe)
+            if ix0 >= ix1 or iy0 >= iy1:
+                continue
+
+            if tile_name not in tile_cache:
+                y_names_sample = [t[0] for t in y_tiles[:5]]
+                cache_sample = list(tile_cache.keys())[:5]
+                import sys as _sys
+                _sys.stderr.write(
+                    f"\n[xblock DEBUG] MISS tile_name={tile_name!r} "
+                    f"y0={y0} y1={y1} x0={x0} x1={x1} "
+                    f"y_tiles_len={len(y_tiles)} tile_cache_size={len(tile_cache)}\n"
+                    f"  y_tiles head: {y_names_sample}\n"
+                    f"  tile_cache head: {cache_sample}\n"
+                )
+                _sys.stderr.flush()
+            tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+            # Output slice is X-block-local (not band-global): the caller receives
+            # an array of shape (T, C, Z, band_h, x1 - x0) starting at column 0.
+            out_sl = (
+                slice(0, t_end), slice(0, c_end), slice(0, z_end),
+                slice(iy0 - y0, iy1 - y0),
+                slice(ix0 - x0, ix1 - x0),
+            )
+            tile_sl = (
+                slice(0, t_end), slice(0, c_end), slice(0, z_end),
+                slice(iy0 - ys, iy1 - ys),
+                slice(ix0 - xs, ix1 - xs),
+            )
+            block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
+
+            if use_edt:
+                wloc = tile_weights[
+                    (iy0 - ys):(iy1 - ys), (ix0 - xs):(ix1 - xs)
+                ]
+                wloc = xp.asarray(wloc, dtype=dtype_val)
+                nz = block != 0
+                wloc = wloc * nz
+                numer[out_sl] += block * wloc
+                denom[out_sl] += wloc
+            else:
+                numer[out_sl] += block
+                denom[out_sl] += (block != 0).astype(dtype_val)
+            n_tiles_hit_total += 1
+
+        # Normalize in-place and cast to output dtype so the D2H that follows
+        # transfers half the bytes (uint16 vs float32 for LiveScreen).
+        xp.maximum(denom, 1e-12, out=denom)
+        xp.divide(numer, denom, out=numer)
+        del denom
+        xp.nan_to_num(numer, copy=False)
+        if numer.dtype != out_dtype:
+            norm_x = numer.astype(out_dtype)
+            del numer
+        else:
+            norm_x = numer
+        xp.get_default_memory_pool().free_all_blocks()
+
+        if profile:
+            xp.cuda.Device().synchronize()
+            t_accum_total += time.time() - t_a
+
+        yield x0, x1, norm_x
+
+    if profile and timings_out is not None:
+        timings_out["accum"] = t_accum_total
+        timings_out["n_tiles_hit"] = n_tiles_hit_total
+        timings_out["alloc"] = 0.0
+        timings_out["normalize"] = 0.0
+
+
 def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
                         dtype_val, use_edt, tile_weights, profile=False,
                         return_gpu=False):
@@ -463,6 +596,34 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
         )
     ] = norm_cpu
     return data_bytes, time.time() - t0
+
+
+def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
+                          blosc_codec, y0, x0, _write_executor, _write_futures):
+    """Per-X-block D2H + direct-chunk-write. Companion to `_process_y_band_gpu_xblock`.
+
+    Runs in the D2H worker thread. Allocates a pinned numpy buffer sized
+    exactly to ``norm_gpu_x.shape`` (guaranteed contiguous), D2Hs into it,
+    then copies out and submits the direct chunk write. Cupy's pinned memory
+    pool caches allocations, so repeated calls with the same shape are cheap.
+    """
+    import cupyx
+    with transfer_stream:
+        # cupyx.empty_pinned allocates a contiguous page-locked numpy buffer.
+        # Pool-cached across calls with matching shape/dtype.
+        pinned_buf = cupyx.empty_pinned(norm_gpu_x.shape, dtype=norm_gpu_x.dtype)
+        norm_gpu_x.get(out=pinned_buf)
+    del norm_gpu_x
+    xp.get_default_memory_pool().free_all_blocks()
+    # Copy payload out of pinned memory so the write pool doesn't pin it —
+    # frees the pool slot for the next D2H's reuse.
+    block_cpu = pinned_buf.copy()
+    del pinned_buf
+    fut = _write_executor.submit(
+        _write_zarr_block_direct, chunk_root, chunk_hw, blosc_codec,
+        y0, x0, block_cpu,
+    )
+    _write_futures.append(fut)
 
 
 def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu):
@@ -755,6 +916,9 @@ def assemble_streaming(
     tile_shapes: Optional[Dict[str, tuple]] = None,
     tile_loader=None,
     use_direct_writes: bool = False,
+    xblock_scoped_gpu: bool = False,
+    n_concurrent_bands: int = 1,
+    y_range: Optional[Tuple[int, int]] = None,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -853,11 +1017,16 @@ def assemble_streaming(
         arr_out = stitched_pos["0"]
     dtype_idx = _resolve_shift_dtype(shifts, tile_size, base_bits=32)
 
-    # Precompute tile metadata for fast intersection checks (using cached shapes)
+    # Precompute tile metadata for fast intersection checks. Stay on CPU (numpy)
+    # for this loop — cupy's `xp.asarray` per tile allocates a 2-element device
+    # array + forces a D2H sync via `int(shift_array[0])`, adding a ~50 us
+    # kernel launch per tile. For 167k tiles that's ~30 s single-process and
+    # >2 min when 4 spawn-workers serialize on the shared CUDA driver context.
+    import numpy as _np
     tile_meta = []
     for tile_name, shift in shifts.items():
         ts = tile_shapes[tile_name]
-        shift_array = xp.asarray(shift, dtype=dtype_idx)
+        shift_array = _np.asarray(shift, dtype=dtype_idx)
         t_end = min(ts[0], final_shape[0])
         c_end = min(ts[1], final_shape[1])
         z_end = min(ts[2], final_shape[2])
@@ -869,26 +1038,35 @@ def assemble_streaming(
     ty, tx = divide_tile_size if divide_tile_size is not None else (1024, 1024)
     total_y, total_x = final_shape[-2], final_shape[-1]
 
-    # Pre-identify all Y-bands and their tiles for batch loading
+    # Pre-identify all Y-bands and their tiles for batch loading.
+    # When ``y_range=(y_start, y_end)`` is set, only include bands that fall
+    # inside it. Multi-process runners use this to partition the canvas across
+    # worker processes without touching each other's chunks (direct writes,
+    # disjoint Y ranges → no coordination needed).
+    y_start_filt, y_end_filt = (y_range if y_range is not None else (0, total_y))
     y_bands = []
     for y0 in range(0, total_y, ty):
         y1 = min(total_y, y0 + ty)
+        if y1 <= y_start_filt or y0 >= y_end_filt:
+            continue
         y_tiles = [
             (nm, t_end, c_end, z_end, ys, ye, xs, xe)
             for (nm, t_end, c_end, z_end, ys, ye, xs, xe) in tile_meta
             if not (ye <= y0 or ys >= y1)
         ]
         y_bands.append((y0, y1, y_tiles))
+    if y_range is not None:
+        print(f"[assemble.streaming] y_range={y_range} → {len(y_bands)} bands")
 
     # Pipeline: prefetch multiple Y-bands ahead so tiles are ready when GPU needs them.
     # With 2 concurrent loaders and 3-band prefetch, effective loading rate (~3.5s/band)
     # roughly matches GPU processing rate (~2-3s/band), eliminating most tile-wait stalls.
-    _pipeline_executor = ThreadPoolExecutor(max_workers=4)
-    # Prefetch depth 4: with pinned D2H making per-band GPU work ~1s (down from
-    # ~10s), load is now the wall (~5-8s per band). Deeper prefetch = more
-    # overlap. HCS-converted store is per-FOV, so no 1-GB shard reads to worry
-    # about like raw-shard mode.
-    _prefetch_depth = 4
+    # Env-configurable prefetch depth. Multi-process runs with N_procs > 1
+    # should set OPS_PREFETCH_DEPTH to 1-2 to keep total NFS open count
+    # (N_procs × prefetch_depth × loader_threads) under the mount's RPC-slot
+    # cap. Default 4 for single-process (deep pipeline hides ~5-8 s load).
+    _prefetch_depth = int(os.environ.get("OPS_PREFETCH_DEPTH", "4"))
+    _pipeline_executor = ThreadPoolExecutor(max_workers=max(2, _prefetch_depth))
 
     # Background writer: submit zarr writes to a thread pool so GPU can
     # continue with the next Y-band while chunks are flushed to disk.
@@ -910,7 +1088,11 @@ def assemble_streaming(
     # out before the next D2H starts). cupyx.empty_pinned returns a numpy
     # view backed by pinned memory (bypasses np.frombuffer's 4 GiB cap).
     _pinned_buffer = None
-    if _USING_CUPY:
+    if _USING_CUPY and not xblock_scoped_gpu:
+        # Full-band path: one big pinned buffer sized to the max band. In the
+        # xblock-scoped path, `_d2h_and_write_xblock` allocates per-call and
+        # relies on cupy's pinned pool for cheap reuse — a fixed buffer here
+        # is unnecessary and would waste ~9 GB of pinned memory.
         import cupyx
         max_band_h = max((y1 - y0) for y0, y1, _ in y_bands)
         pinned_shape = (final_shape[0], final_shape[1], final_shape[2], max_band_h, total_x)
@@ -962,6 +1144,25 @@ def assemble_streaming(
               f"chunk_hw=({chunk_h_arr},{chunk_w_arr})  "
               f"codec={'blosc-' + blosc_cfg['configuration']['cname'] if blosc_cfg else 'none'}")
 
+    # Multi-band concurrency (Phase 2): run N bands in parallel, each on its
+    # own CUDA stream. Kernel launches for band N don't stall band N+1's
+    # launches — expected win when GPU util is limited by launch/Python-loop
+    # overhead (measured ~12-15% util on single-band xblock-scoped runs).
+    # Each band's peak GPU memory is only ~70 MB (per-x-block), so N=4-8 fits.
+    _band_stream_pool = None
+    _band_executor = None
+    _inflight_band_futures = deque()
+    if _USING_CUPY and xblock_scoped_gpu and n_concurrent_bands > 1:
+        _band_stream_pool = [
+            xp.cuda.Stream(non_blocking=True) for _ in range(n_concurrent_bands)
+        ]
+        _band_executor = ThreadPoolExecutor(max_workers=n_concurrent_bands)
+        print(f"[assemble.streaming] n_concurrent_bands={n_concurrent_bands}  "
+              f"streams={len(_band_stream_pool)}")
+    elif _USING_CUPY and xblock_scoped_gpu:
+        # Serial-band path still uses a single stream reference for the helper.
+        _band_stream_pool = [xp.cuda.Stream(non_blocking=True)]
+
     _load_futures = deque()
     for i in range(min(_prefetch_depth, len(y_bands))):
         _load_futures.append(_pipeline_executor.submit(
@@ -992,7 +1193,74 @@ def assemble_streaming(
 
         # Full Y-band GPU processing with pipelined D2H
         t_process_start = time.time()
-        if _USING_CUPY:
+        if _USING_CUPY and xblock_scoped_gpu:
+            # X-block-scoped path: allocate tiny per-X-block numer/denom (~34 MB
+            # each), yield (x0, x1, norm_gpu_x) per X-block, submit per-X-block
+            # D2H+direct-write. Peak GPU memory drops ~500× vs the full-band
+            # path — enables running multiple bands per GPU (Phase 2) and multi
+            # GPU (Phase 3). Requires direct writes (chunk-aligned x blocks).
+            assert _direct_write_config is not None, (
+                "xblock_scoped_gpu requires use_direct_writes=True"
+            )
+
+            def _run_one_band_xblock(y0_b, y1_b, band_tiles, tile_cache_b,
+                                     stream_b, band_slot):
+                """Process one band on its own CUDA stream. Returns wall time."""
+                t_b0 = time.time()
+                b_timings = {} if profile else None
+                with stream_b:
+                    gen_b = _process_y_band_gpu_xblock(
+                        y0_b, y1_b, total_x, band_tiles, tile_cache_b, final_shape,
+                        dtype_val, arr_out.dtype, use_edt, tile_weights, tx,
+                        profile=profile, timings_out=b_timings,
+                    )
+                    d2h_futs = []
+                    for x0_x, x1_x, norm_gpu_x in gen_b:
+                        _MAX_WRITE_FUTURES = 5000
+                        while len(_write_futures) > _MAX_WRITE_FUTURES:
+                            _write_futures[0].result()
+                            _write_futures.pop(0)
+                        fut = _d2h_executor.submit(
+                            _d2h_and_write_xblock, norm_gpu_x, _transfer_stream,
+                            _direct_write_config["chunk_root"],
+                            _direct_write_config["chunk_hw"],
+                            _direct_write_config["blosc_codec"],
+                            y0_b, x0_x,
+                            _write_executor, _write_futures,
+                        )
+                        d2h_futs.append(fut)
+                    for f in d2h_futs:
+                        f.result()
+                    xp.get_default_memory_pool().free_all_blocks()
+                t_elapsed = time.time() - t_b0
+                if profile and b_timings:
+                    print(f"  [Y-band {band_slot+1}] XBLOCK slot={band_slot} "
+                          f"accum={b_timings['accum']*1000:.1f}ms "
+                          f"({b_timings['n_tiles_hit']} tiles)  "
+                          f"total={t_elapsed:.2f}s")
+                return t_elapsed
+
+            if n_concurrent_bands <= 1:
+                # Serial path (unchanged behavior).
+                _run_one_band_xblock(y0, y1, y_tiles, tile_cache, _band_stream_pool[0], band_idx)
+            else:
+                # Multi-band path: push this band to the band-executor and
+                # backpressure so at most `n_concurrent_bands` are in flight.
+                # Each band owns a distinct CUDA stream from `_band_stream_pool`
+                # so kernel launches don't stall on the default stream.
+                stream_b = _band_stream_pool[band_idx % n_concurrent_bands]
+                fut = _band_executor.submit(
+                    _run_one_band_xblock, y0, y1, y_tiles, tile_cache,
+                    stream_b, band_idx,
+                )
+                _inflight_band_futures.append(fut)
+                while len(_inflight_band_futures) >= n_concurrent_bands:
+                    _inflight_band_futures.popleft().result()
+
+            t_process_elapsed = time.time() - t_process_start
+            print(f"  [Y-band {band_idx+1}/{len(y_bands)}] XBLOCK submit "
+                  f"total={t_process_elapsed:.2f}s (concurrency={n_concurrent_bands})")
+        elif _USING_CUPY:
             ret = _process_y_band_gpu(
                 y0, y1, total_x, y_tiles, tile_cache, final_shape,
                 dtype_val, use_edt, tile_weights, profile=profile,
@@ -1146,9 +1414,14 @@ def assemble_streaming(
             t_process_elapsed = time.time() - t_process_start
             print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Processing: {t_process_elapsed:.2f}s")
 
-        # Free cache for this Y band
+        # Free cache for this Y band. NOTE: don't call .clear() when running
+        # the multi-band concurrent path — the dict reference has been handed
+        # to a worker thread that is still iterating it. Just drop this loop's
+        # local reference; the worker's copy keeps the dict alive until it
+        # finishes, then Python GC reclaims it.
         t_cleanup = time.time()
-        tile_cache.clear()
+        if not (xblock_scoped_gpu and n_concurrent_bands > 1):
+            tile_cache.clear()
         t_cleanup_elapsed = time.time() - t_cleanup
 
         t_band_elapsed = time.time() - t_band_start
@@ -1159,6 +1432,12 @@ def assemble_streaming(
             print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Total: {t_band_elapsed:.2f}s ({len(x_blocks)} X-blocks)")
 
     _pipeline_executor.shutdown(wait=False)
+
+    # Drain any remaining in-flight band futures (multi-band concurrency path).
+    while _inflight_band_futures:
+        _inflight_band_futures.popleft().result()
+    if _band_executor is not None:
+        _band_executor.shutdown(wait=True)
 
     # Wait for last band's D2H + write submission to complete
     if _prev_d2h_future is not None:
