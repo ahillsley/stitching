@@ -382,31 +382,71 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
 
 
 def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
-                           y0, y1, tx, total_x, _write_executor, _write_futures):
+                           y0, y1, tx, total_x, _write_executor, _write_futures,
+                           pinned_buffer=None,
+                           direct_write_config=None):
     """Transfer GPU result to CPU on a dedicated stream, then submit zarr writes.
 
     Runs in a background thread so the main thread can start the next band's
     GPU compute while this D2H transfer is in progress.  The transfer_stream
     ensures the DMA engine handles the copy independently of the compute stream.
+
+    ``pinned_buffer`` (optional): a pre-allocated PAGE-LOCKED (pinned) numpy
+    array sized to hold one full-height band. Using pinned host memory lets
+    cupy DMA at PCIe-line speed (~50 GB/s on H100 gen5) instead of ~1.5 GB/s
+    for unpinned transfers. Buffer is reused across bands — safe because we
+    copy every x-block slice out before submitting writes.
     """
     with transfer_stream:
-        norm_cpu = norm_gpu.get()  # syncs transfer_stream only, then DMA copy
-    del norm_gpu
-    # Release GPU memory immediately so other parallel wells can use it
+        # Cast to output dtype (uint16 for LiveScreen) on the GPU before D2H
+        # so we transfer 9.5 GB instead of 19 GB (float32).
+        out_dtype = arr_out.dtype
+        if norm_gpu.dtype != out_dtype:
+            norm_gpu_cast = norm_gpu.astype(out_dtype, copy=False)
+            del norm_gpu
+            xp.get_default_memory_pool().free_all_blocks()
+        else:
+            norm_gpu_cast = norm_gpu
+        if pinned_buffer is not None:
+            # D2H directly into a pinned host slot the exact size of this band.
+            # cupy's `.get(out=)` triggers the pinned fast path.
+            band_h = y1 - y0
+            pinned_slot = pinned_buffer[:, :, :, :band_h, :]
+            norm_gpu_cast.get(out=pinned_slot)
+            norm_cpu = pinned_slot
+        else:
+            norm_cpu = norm_gpu_cast.get()
+    del norm_gpu_cast
     xp.get_default_memory_pool().free_all_blocks()
 
-    # Split into X-block chunks for zarr chunk alignment
+    # Split into X-block chunks for zarr chunk alignment. COPY each slice
+    # (don't view) so the whole ~9 GB norm_cpu can be released the moment this
+    # function returns — otherwise every pending write pins the entire band's
+    # buffer, and NFS-slow writes accumulate bands' worth of memory (verified:
+    # ~50 GB/band RSS growth until OOM). One 9 GB memcpy per band is cheap;
+    # the payoff is that write pool depth becomes decoupled from resident
+    # bytes, so writes can drain at NFS's pace without stalling GPU work.
     for x0 in range(0, total_x, tx):
         x1 = min(total_x, x0 + tx)
-        block_cpu = norm_cpu[:, :, :, :, x0:x1]
-        fut = _write_executor.submit(
-            _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, block_cpu
-        )
+        block_cpu = norm_cpu[:, :, :, :, x0:x1].copy()
+        if direct_write_config is not None:
+            fut = _write_executor.submit(
+                _write_zarr_block_direct,
+                direct_write_config["chunk_root"],
+                direct_write_config["chunk_hw"],
+                direct_write_config["blosc_codec"],
+                y0, x0, block_cpu,
+            )
+        else:
+            fut = _write_executor.submit(
+                _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, block_cpu
+            )
         _write_futures.append(fut)
+    del norm_cpu
 
 
 def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
-    """Write a single normalized block to the output zarr array.
+    """Write a single normalized block to the output zarr array (via zarr API).
 
     Called from a background thread to overlap writes with GPU processing.
     Returns (data_bytes, elapsed) for profiling.
@@ -425,12 +465,54 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
     return data_bytes, time.time() - t0
 
 
-def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90):
+def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu):
+    """Write a chunk-aligned block to a zarr V3 array by writing chunk files
+    directly — bypassing zarr's sync API which serializes on a shared asyncio
+    event loop (probe measured ~5-8× write speedup vs the ``arr[slice] = data``
+    path).
+
+    ``chunk_root``: filesystem root of the target array (``arr_out.store.root``).
+    ``chunk_hw``: (chunk_H, chunk_W). Must match the array's chunk shape in Y/X.
+    ``blosc_codec``: ``numcodecs.Blosc`` instance (or None for no compression),
+        matching the array's blosc codec configuration in ``zarr.json``.
+    ``y0``, ``x0``: element-space top-left of the band-x-block; must be chunk
+        aligned (i.e. ``y0 % chunk_H == 0`` and ``x0 % chunk_W == 0``).
+    ``norm_cpu``: ndarray of shape (T=1, C, Z=1, chunk_H, chunk_W). Each channel
+        becomes one chunk file at ``c/0/{C}/0/{Y_idx}/{X_idx}``.
+    """
+    t0 = time.time()
+    chunk_h, chunk_w = chunk_hw
+    y_idx = y0 // chunk_h
+    x_idx = x0 // chunk_w
+    n_c = norm_cpu.shape[1]
+    total_bytes = 0
+    for c in range(n_c):
+        chunk_arr = norm_cpu[0:1, c:c+1, 0:1, :, :]
+        raw = chunk_arr.tobytes()
+        payload = blosc_codec.encode(raw) if blosc_codec is not None else raw
+        total_bytes += norm_cpu[0, c, 0].nbytes
+        chunk_path = f"{chunk_root}/c/0/{c}/0/{y_idx}/{x_idx}"
+        parent = chunk_path.rsplit("/", 1)[0]
+        os.makedirs(parent, exist_ok=True)
+        with open(chunk_path, "wb") as fh:
+            fh.write(payload)
+    return total_bytes, time.time() - t0
+
+
+def _load_band_tiles(y_tiles, store_path, flipud, fliplr, rot90, tile_loader=None):
     """Load all tiles for a Y-band in parallel, returning a tile_cache dict.
 
     Uses direct zarr array access (bypasses iohub HCS metadata parsing).
     Used for pipelined I/O: loading band N+1 while GPU processes band N.
+
+    ``tile_loader`` (optional): pluggable callable with signature
+    ``(y_tiles, store_path, flipud, fliplr, rot90) -> tile_cache``. When
+    provided, entirely replaces the default HCS-per-FOV reader — used by the
+    LiveScreen path to feed raw acquire-zarr shards through this pipeline.
     """
+    if tile_loader is not None:
+        return tile_loader(y_tiles, store_path, flipud, fliplr, rot90)
+
     tile_cache = {}
 
     def _load_single(tile_meta):
@@ -670,6 +752,9 @@ def assemble_streaming(
     per_channel_edt: bool = True,
     parallel_y_bands: bool = False,
     n_workers: Optional[int] = None,
+    tile_shapes: Optional[Dict[str, tuple]] = None,
+    tile_loader=None,
+    use_direct_writes: bool = False,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -695,14 +780,17 @@ def assemble_streaming(
         print(f"[assemble.streaming] PROFILING ENABLED (GPU syncs will slow overall runtime)")
 
     # Read tile shapes directly from array JSON files (avoids opening full HCS store).
+    # If the caller supplied ``tile_shapes`` (LiveScreen path — no HCS on disk),
+    # trust that instead of reading per-tile json files.
     fov_store_p = Path(fov_store_path)
-    tile_shapes = {}
-    for tname in shifts.keys():
-        arr_dir = fov_store_p / tname / "0"
-        arr_meta_path = arr_dir / "zarr.json" if (arr_dir / "zarr.json").exists() else arr_dir / ".zarray"
-        with open(arr_meta_path) as f:
-            meta = json.load(f)
-        tile_shapes[tname] = tuple(meta["shape"])
+    if tile_shapes is None:
+        tile_shapes = {}
+        for tname in shifts.keys():
+            arr_dir = fov_store_p / tname / "0"
+            arr_meta_path = arr_dir / "zarr.json" if (arr_dir / "zarr.json").exists() else arr_dir / ".zarray"
+            with open(arr_meta_path) as f:
+                meta = json.load(f)
+            tile_shapes[tname] = tuple(meta["shape"])
 
     # Determine target T,C,Z
     tcz_list = [s[:3] for s in tile_shapes.values()]
@@ -795,25 +883,90 @@ def assemble_streaming(
     # Pipeline: prefetch multiple Y-bands ahead so tiles are ready when GPU needs them.
     # With 2 concurrent loaders and 3-band prefetch, effective loading rate (~3.5s/band)
     # roughly matches GPU processing rate (~2-3s/band), eliminating most tile-wait stalls.
-    _pipeline_executor = ThreadPoolExecutor(max_workers=2)
-    _prefetch_depth = 3
+    _pipeline_executor = ThreadPoolExecutor(max_workers=4)
+    # Prefetch depth 4: with pinned D2H making per-band GPU work ~1s (down from
+    # ~10s), load is now the wall (~5-8s per band). Deeper prefetch = more
+    # overlap. HCS-converted store is per-FOV, so no 1-GB shard reads to worry
+    # about like raw-shard mode.
+    _prefetch_depth = 4
 
     # Background writer: submit zarr writes to a thread pool so GPU can
     # continue with the next Y-band while chunks are flushed to disk.
-    # Zarr chunks are independent files — parallel writes are safe.
-    _write_executor = ThreadPoolExecutor(max_workers=14)
+    # 32-way matches what the LiveScreen convert step used to hit ~4 GB/s NFS.
+    _write_executor = ThreadPoolExecutor(max_workers=32)
     _write_futures = []
 
-    # D2H pipelining: transfer GPU results to CPU on a dedicated CUDA stream
-    # in a background thread, so GPU can start the next band's compute immediately.
+    # D2H pipelining: single worker (norm_gpu is 19 GB per band and two of them
+    # + a band's 38 GB numer/denom is right at H100 80 GB — no room for more
+    # in-flight D2H). But we schedule compute of band N+1 to OVERLAP D2H of
+    # band N, so PCIe transfer hides behind subsequent GPU compute.
     _d2h_executor = ThreadPoolExecutor(max_workers=1)
     _transfer_stream = xp.cuda.Stream(non_blocking=True) if _USING_CUPY else None
     _prev_d2h_future = None
+    # Pinned host memory for D2H destination. Cupy's `.get()` on unpinned
+    # buffers caps at ~1.5 GB/s on H100 gen5 (pageable-memory throttle);
+    # writing into pinned memory hits full-line ~50 GB/s. Sized to the maximum
+    # band's uint16 output. Reused across bands (safe: writes copy each x-block
+    # out before the next D2H starts). cupyx.empty_pinned returns a numpy
+    # view backed by pinned memory (bypasses np.frombuffer's 4 GiB cap).
+    _pinned_buffer = None
+    if _USING_CUPY:
+        import cupyx
+        max_band_h = max((y1 - y0) for y0, y1, _ in y_bands)
+        pinned_shape = (final_shape[0], final_shape[1], final_shape[2], max_band_h, total_x)
+        _pinned_buffer = cupyx.empty_pinned(pinned_shape, dtype=arr_out.dtype)
+        pinned_nbytes = _pinned_buffer.nbytes
+        print(f"[assemble.streaming] pinned buffer: {pinned_nbytes/1e9:.1f} GB "
+              f"shape={pinned_shape} dtype={arr_out.dtype}")
+
+    # Direct-write path: bypass zarr's sync API which serializes on a shared
+    # asyncio event loop and caps write throughput at ~500 MB/s regardless of
+    # thread count. Direct chunk writes (encode via numcodecs + open().write())
+    # scaled to ~2.8 GB/s at 16 workers on our probe. Only valid when
+    # divide_tile_size matches the array's chunk shape (writes are then
+    # exactly 1 chunk each — no partial-chunk read-modify-write).
+    _direct_write_config = None
+    if use_direct_writes:
+        import numcodecs
+        chunk_h_arr = arr_out.chunks[-2]
+        chunk_w_arr = arr_out.chunks[-1]
+        tile_h_out, tile_w_out = divide_tile_size or (chunk_h_arr, chunk_w_arr)
+        assert tile_h_out == chunk_h_arr and tile_w_out == chunk_w_arr, (
+            f"use_direct_writes requires divide_tile_size ({tile_h_out},{tile_w_out}) "
+            f"to match array chunk shape ({chunk_h_arr},{chunk_w_arr})"
+        )
+        # Read the array's zarr.json to reconstruct the blosc codec (so our
+        # direct writes produce bytes consistent with what the metadata claims).
+        # ``arr_out.store.root`` = whole store root; ``arr_out.path`` = the
+        # array's subpath inside it (e.g. "A/1/0/0"). Compose to the array dir.
+        from pathlib import Path as _P
+        arr_root = _P(arr_out.store.root) / arr_out.path.strip("/")
+        meta = json.loads((arr_root / "zarr.json").read_text())
+        blosc_cfg = next(
+            (c for c in meta["codecs"] if c.get("name") == "blosc"), None
+        )
+        blosc_codec = None
+        if blosc_cfg:
+            _shuffle = {"noshuffle": 0, "shuffle": 1, "bitshuffle": 2}
+            cc = blosc_cfg["configuration"]
+            blosc_codec = numcodecs.Blosc(
+                cname=cc["cname"], clevel=cc["clevel"],
+                shuffle=_shuffle[cc["shuffle"]],
+            )
+        _direct_write_config = {
+            "chunk_root": str(arr_root),
+            "chunk_hw": (chunk_h_arr, chunk_w_arr),
+            "blosc_codec": blosc_codec,
+        }
+        print(f"[assemble.streaming] direct writes enabled  chunk_root={arr_root}  "
+              f"chunk_hw=({chunk_h_arr},{chunk_w_arr})  "
+              f"codec={'blosc-' + blosc_cfg['configuration']['cname'] if blosc_cfg else 'none'}")
 
     _load_futures = deque()
     for i in range(min(_prefetch_depth, len(y_bands))):
         _load_futures.append(_pipeline_executor.submit(
-            _load_band_tiles, y_bands[i][2], fov_store_p, flipud, fliplr, rot90
+            _load_band_tiles, y_bands[i][2], fov_store_p, flipud, fliplr, rot90,
+            tile_loader,
         ))
 
     for band_idx, (y0, y1, y_tiles) in enumerate(tqdm(y_bands, desc="Stitching Y")):
@@ -828,7 +981,8 @@ def assemble_streaming(
         next_prefetch = band_idx + _prefetch_depth
         if next_prefetch < len(y_bands):
             _load_futures.append(_pipeline_executor.submit(
-                _load_band_tiles, y_bands[next_prefetch][2], fov_store_p, flipud, fliplr, rot90
+                _load_band_tiles, y_bands[next_prefetch][2], fov_store_p, flipud, fliplr, rot90,
+                tile_loader,
             ))
 
         print(f"  [Y-band {band_idx+1}/{len(y_bands)}] Loaded {len(y_tiles)} tiles (waited {t_load_elapsed:.2f}s)")
@@ -851,16 +1005,29 @@ def assemble_streaming(
 
             t_process_elapsed = time.time() - t_process_start
 
-            # Wait for previous band's D2H + writes to complete before submitting new one
+            # Wait for previous band's D2H task to finish BEFORE submitting the
+            # next one, but AFTER we've already done this band's compute — so
+            # band N+1's compute overlaps band N's D2H. Previously the wait was
+            # before compute (serialized both).
             if _prev_d2h_future is not None:
                 _prev_d2h_future.result()
 
+            # CPU-mem backpressure: with per-x-block .copy() in _d2h_and_submit_writes
+            # each pending future owns just ~8 MB, so we can safely queue thousands
+            # of writes without pinning entire bands. Cap the futures deque so it
+            # doesn't grow without bound if NFS gets very slow.
+            _MAX_WRITE_FUTURES = 5000
+            while len(_write_futures) > _MAX_WRITE_FUTURES:
+                _write_futures[0].result()
+                _write_futures.pop(0)
+
             # Submit D2H + write for current band in background thread.
-            # GPU is free to process next band while DMA engine handles the transfer.
             _prev_d2h_future = _d2h_executor.submit(
                 _d2h_and_submit_writes, norm_gpu, _transfer_stream,
                 arr_out, final_shape, y0, y1, tx, total_x,
                 _write_executor, _write_futures,
+                _pinned_buffer,
+                _direct_write_config,
             )
 
             # Release freed GPU memory back to CUDA so other parallel wells
