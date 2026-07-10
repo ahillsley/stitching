@@ -2384,7 +2384,12 @@ def stitch(
     # takes minutes; reading one position's JSON files is instant.
     input_store_p = Path(input_store_path)
     first_pos_key = next(iter(all_shifts.keys()))  # e.g. "A/1/002026"
-    ngff_version = kwargs.get("ngff_version", "0.4")
+    # NGFF version of the INPUT store. Honor an explicit kwarg; otherwise detect
+    # from the on-disk metadata (v3 writes zarr.json, v2 writes .zattrs) so the
+    # reader stays correct when an upstream step switches a store to v3.
+    ngff_version = kwargs.get("ngff_version")
+    if ngff_version is None:
+        ngff_version = "0.5" if (input_store_p / first_pos_key / "zarr.json").exists() else "0.4"
     # Validate once here so every `if ngff_version == "0.5": ... else: ...` block
     # below is provably the 0.4 path in its `else` (an unexpected version fails
     # loudly rather than silently taking the 0.4 branch).
