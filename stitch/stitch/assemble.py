@@ -646,9 +646,20 @@ def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu
     y_idx = y0 // chunk_h
     x_idx = x0 // chunk_w
     n_c = norm_cpu.shape[1]
+    blk_h, blk_w = norm_cpu.shape[3], norm_cpu.shape[4]
     total_bytes = 0
     for c in range(n_c):
         chunk_arr = norm_cpu[0:1, c:c+1, 0:1, :, :]
+        # Zarr v3 stores every chunk — including trailing edge chunks — at the
+        # FULL chunk shape (fill-padded); the array's shape metadata crops it on
+        # read. A truncated edge write is undecodable ("cannot reshape array of
+        # size ... into shape ..."), so pad the bottom/right of edge blocks to
+        # the full chunk before encoding. Only bites the direct-write path — the
+        # zarr-API path (`_write_zarr_block`) pads for us.
+        if blk_h != chunk_h or blk_w != chunk_w:
+            padded = np.zeros((1, 1, 1, chunk_h, chunk_w), dtype=chunk_arr.dtype)
+            padded[:, :, :, :blk_h, :blk_w] = chunk_arr
+            chunk_arr = padded
         raw = chunk_arr.tobytes()
         payload = blosc_codec.encode(raw) if blosc_codec is not None else raw
         total_bytes += norm_cpu[0, c, 0].nbytes
