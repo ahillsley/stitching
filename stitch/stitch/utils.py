@@ -23,21 +23,47 @@ def _device_print(msg: str) -> None:
         print(msg)
 
 
-# Try to use CuPy for GPU acceleration, fall back to NumPy
+# Try to use CuPy for GPU acceleration, fall back to NumPy.
+#
+# IMPORTANT: when this module is imported inside a multiprocessing "spawn"
+# child (e.g. a ProcessPoolExecutor stripe worker), we must NOT touch the
+# GPU here. Probing GPU access (cupy.array([1.0])) creates a CUDA context
+# on whatever GPU CUDA_VISIBLE_DEVICES points to at import time. The
+# parent's CVD is "0,1" (both GPUs visible), so the worker would
+# initialize on GPU 0 — BEFORE a PPE initializer has a chance to set
+# CVD per-worker for round-robin GPU pinning. Result: every worker ends
+# up on GPU 0 regardless of the pin (8× ISS data-loss style bug for the
+# pin path).
+#
+# Solution: skip the GPU probe in spawn children, trust the parent to
+# have already done it, and let cupy initialize lazily on first real
+# array op — at which point any initializer has set the correct CVD.
+import multiprocessing as _mp
+_not_main = _mp.current_process().name != "MainProcess"
+_start_method = _mp.get_start_method(allow_none=True) or ""
+# A fork-child inherits the parent's CUDA context already; only spawn/forkserver
+# children are at risk of probing CUDA before the per-worker initializer runs.
+_in_spawn_child = _not_main and _start_method != "fork"
 try:
     import cupy as xp
     from cupyx.scipy import ndimage as cundi
-    # Check if GPU is actually available at runtime
-    try:
-        _ = xp.array([1.0])  # Test GPU access
+    if _in_spawn_child:
+        # Defer GPU probe — see comment above.
         _USING_CUPY = True
-        _device_print("[utils.py] Using CuPy (GPU) for array operations")
-    except Exception as e:
-        # CuPy imported but no GPU available - fallback to CPU
-        _device_print(f"[utils.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
-        import numpy as xp
-        from scipy import ndimage as cundi
-        _USING_CUPY = False
+        _device_print("[utils.py] CuPy import OK (deferring GPU probe in spawn child)")
+    else:
+        # Parent process or fork child: probe normally to catch the
+        # "cupy imported but no GPU accessible" case (e.g. on a login node).
+        try:
+            _ = xp.array([1.0])  # Test GPU access
+            _USING_CUPY = True
+            _device_print("[utils.py] Using CuPy (GPU) for array operations")
+        except Exception as e:
+            # CuPy imported but no GPU available - fallback to CPU
+            _device_print(f"[utils.py] CuPy available but GPU not accessible ({type(e).__name__}), falling back to CPU")
+            import numpy as xp
+            from scipy import ndimage as cundi
+            _USING_CUPY = False
 except (ModuleNotFoundError, ImportError):
     import numpy as xp
     from scipy import ndimage as cundi
@@ -314,11 +340,22 @@ def _resolve_shift_dtype(shifts: dict, tile_size: tuple, base_bits: int = 32):
 
 
 def get_output_shape(shifts: dict, tile_size: tuple) -> tuple:
-    """Get the output shape of the stitched image from the raw shifts"""
+    """Get the output shape of the stitched image from the raw shifts.
+
+    Uses ``round()`` before ``int()`` so that float-precision noise in the
+    upstream shift solver (e.g. cupy LSMR+IRLS vs scipy L-BFGS-B yielding
+    positions like 25344.99999 vs 25345.00001) does NOT cause the canvas
+    size to jump by ±1 pixel between runs. With plain ``int()`` truncation,
+    such sub-pixel differences in the max-shift tile produced 2-pixel
+    canvas-size jumps and 2-pixel global shifts in downstream
+    bc_stitched outputs (observed 2026-05-24 on ops0154 A/2 stitch:
+    27343×27363 vs 27341×27362 between two solver paths with positions
+    agreeing to 6 decimals — see compare_test_vs_prod investigation).
+    """
 
     x_shifts = [shift[0] for shift in shifts.values()]
     y_shifts = [shift[1] for shift in shifts.values()]
-    max_x = int(xp.max(xp.asarray(x_shifts)))
-    max_y = int(xp.max(xp.asarray(y_shifts)))
+    max_x = int(round(float(xp.max(xp.asarray(x_shifts)))))
+    max_y = int(round(float(xp.max(xp.asarray(y_shifts)))))
 
     return max_x + tile_size[0], max_y + tile_size[1]

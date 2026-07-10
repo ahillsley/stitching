@@ -277,8 +277,9 @@ def _maybe_wrap_for_tensorstore(arr_obj, stitched_pos=None):
             "file_io_concurrency": {"limit": _ts_io},
         })
 
-        # iohub ImageArray exposes .tensorstore(); raw zarr arrays don't.
-        if hasattr(arr_obj, "tensorstore"):
+        # Older iohub ImageArray exposed .tensorstore(); iohub 0.3.x dropped
+        # it AND .store. Fall back via the raw zarr handle (.native).
+        if hasattr(arr_obj, "tensorstore") and callable(arr_obj.tensorstore):
             base_ts = arr_obj.tensorstore()
             # Reopen with our context so concurrency limits apply. The spec
             # already encodes the storage location and codec.
@@ -287,13 +288,36 @@ def _maybe_wrap_for_tensorstore(arr_obj, stitched_pos=None):
             except Exception:
                 ts_array = base_ts  # fall back to iohub's default context
         else:
-            # For raw zarr v3 arrays, we need to open them via tensorstore
-            # ourselves. The path is reachable via the array's store info.
-            store_root = str(arr_obj.store.root) if hasattr(arr_obj.store, "root") else None
-            arr_path = arr_obj.path  # e.g. "A/1/0/0"
-            if store_root is None:
-                return arr_obj  # can't wrap; fall back to direct writes
-            full_path = f"{store_root}/{arr_path}" if arr_path else store_root
+            # No .tensorstore(): open via tensorstore ourselves against the
+            # underlying on-disk path. Find the path through whichever attr
+            # the wrapper exposes: raw zarr arrays have .store and .path
+            # directly; iohub 0.3.x ImageArrays expose them via .native.
+            _store = None
+            _arr_path = ""
+            for _src in (arr_obj, getattr(arr_obj, "native", None)):
+                if _src is None:
+                    continue
+                _s = getattr(_src, "store", None)
+                if _s is not None:
+                    _store = _s
+                    _arr_path = getattr(_src, "path", "") or ""
+                    break
+            if _store is None:
+                # Truly unknown — bail to the direct-write fallback below
+                raise AttributeError(
+                    f"{type(arr_obj).__name__!r} has no .store or .native.store; "
+                    "cannot wrap with tensorstore"
+                )
+            store_root = (
+                str(getattr(_store, "root", None))
+                if getattr(_store, "root", None) is not None
+                else str(getattr(_store, "path", None) or "")
+            )
+            if not store_root or store_root == "None":
+                raise AttributeError(
+                    "store has no usable root/path; cannot wrap with tensorstore"
+                )
+            full_path = f"{store_root}/{_arr_path}" if _arr_path else store_root
             ts_array = ts.open({
                 "driver": "zarr3",
                 "kvstore": {"driver": "file", "path": full_path},
@@ -2715,10 +2739,15 @@ def stitch(
                 t_end = min(ts[0], final_shape[0])
                 c_end = min(ts[1], final_shape[1])
                 z_end = min(ts[2], final_shape[2])
-                ys = int(shift[0])
-                ye = int(shift[0] + tile_shape[-2])
-                xs = int(shift[1])
-                xe = int(shift[1] + tile_shape[-1])
+                # Round (not truncate) so sub-pixel float noise in the upstream
+                # shift solver doesn't move per-tile placement by ±1 pixel
+                # between runs. See utils.get_output_shape for the same fix at
+                # canvas level. Compute ys/xs first so ye-ys stays exactly
+                # tile_shape (mixed round/truncate would corrupt the invariant).
+                ys = int(round(float(shift[0])))
+                xs = int(round(float(shift[1])))
+                ye = ys + int(tile_shape[-2])
+                xe = xs + int(tile_shape[-1])
                 tile_meta.append((tile_name, t_end, c_end, z_end, ys, ye, xs, xe))
 
             # Pre-identify Y-bands and their contributing tiles
