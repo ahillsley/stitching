@@ -1753,7 +1753,7 @@ def _process_well_subprocess_entry(args):
                     # handles this case.
                     pass
 
-        group_path = f"{output_store_path}/A/{well_id}/0"
+        group_path = f"{output_store_path}/{well_id}/0"
         try:
             stitched_pos = _PositionStub(group_path)
 
@@ -1878,7 +1878,7 @@ def _process_stripe_subprocess_entry(args):
             pass
 
     try:
-        group_path = f"{output_store_path}/A/{well_id}/0"
+        group_path = f"{output_store_path}/{well_id}/0"
         stitched_pos = _StripePositionStub(group_path)
 
         _assemble(
@@ -1921,7 +1921,7 @@ def _process_single_well(well_id, shifts, output_store, input_store_path, tile_s
 
         # Thread-safe creation of stitched position
         with well_lock:
-            stitched_pos = output_store.create_position("A", well_id, "0")
+            stitched_pos = output_store.create_position(*well_id.split("/"), "0")
             # Propagate v3 shards_ratio (if any) so downstream create_zeros calls
             # write v3-formatted arrays. Tagged on the position because the inner
             # functions don't know about it otherwise.
@@ -1989,7 +1989,7 @@ def _stitch_band_dask_worker(well_id, band_idx, y0, y1, y_tiles,
               f"y=[{y0}:{y1}] tiles={len(y_tiles)} (PID={os.getpid()})")
 
         # Open output zarr array directly (instant, no HCS parsing)
-        arr_out = zarr.open(os.path.join(output_store_path, "A", well_id, "0", "0"), mode="r+")
+        arr_out = zarr.open(os.path.join(output_store_path, well_id, "0", "0"), mode="r+")
 
         # Compute EDT weights on this worker's GPU
         dtype_val = _resolve_value_dtype(value_precision_bits)
@@ -2156,7 +2156,7 @@ def _stitch_bands_loop_worker(
                 )
 
                 arr_out = zarr.open(
-                    os.path.join(output_store_path, "A", well_id, "0", "0"),
+                    os.path.join(output_store_path, well_id, "0", "0"),
                     mode="r+",
                 )
 
@@ -2396,7 +2396,9 @@ def stitch(
     all_shifts = read_shifts_biahub(config_path)
 
     def get_group(key):
-        return key.split("/")[1]
+        # Group by full row/col (e.g. "A/1", "B/2") so wells in different rows
+        # never collapse into the same well_id.
+        return "/".join(key.split("/")[:2])
 
     grouped_shifts = defaultdict(dict)
     for key, value in all_shifts.items():
@@ -2629,7 +2631,7 @@ def stitch(
             tc_chunk = (final_shape[0], final_shape[1]) if chunk_tc else (1, 1)
             chunks_size = (tc_chunk[0], tc_chunk[1], 1, ty_band, tx_write)
 
-            stitched_pos = output_store.create_position("A", well_id, "0")
+            stitched_pos = output_store.create_position(*well_id.split("/"), "0")
             if use_v3_shards:
                 # Prefer the channel-aware shards_ratio that outer stitch()
                 # computed (v3-native path). Fall back to the env-var formula
@@ -2703,7 +2705,7 @@ def stitch(
             # with the same compression ratio (~2.1x). iohub hardcodes zstd;
             # patch .zarray. Zarr v3 has its own codec block — leave it.
             zarray_path = (
-                Path(output_store_path) / "A" / well_id / "0" / "0" / ".zarray"
+                Path(output_store_path) / well_id / "0" / "0" / ".zarray"
             )
             if not use_v3_shards and zarray_path.exists():
                 with open(zarray_path) as f:
@@ -3000,7 +3002,7 @@ def stitch(
         # _detect_layout raises KeyError on a plate without 'plate' attrs).
         for well_id in well_ids:
             try:
-                pos = output_store.create_position("A", well_id, "0")
+                pos = output_store.create_position(*well_id.split("/"), "0")
                 v3_shards = kwargs.get("v3_shards_ratio")
                 if v3_shards is not None:
                     pos._v3_shards_ratio = v3_shards
@@ -3058,12 +3060,12 @@ def stitch(
         # raw zarr.
         for well_id in well_ids:
             try:
-                pos = output_store.create_position("A", well_id, "0")
+                pos = output_store.create_position(*well_id.split("/"), "0")
                 v3_shards_in = kwargs.get("v3_shards_ratio")
                 if v3_shards_in is not None:
                     pos._v3_shards_ratio = v3_shards_in
                 # Pre-create the output array so workers can open as r+
-                final_shape = output_store.get_well_final_shape("A", well_id) \
+                final_shape = output_store.get_well_final_shape(*well_id.split("/")) \
                     if hasattr(output_store, "get_well_final_shape") else None
                 # Fall back to computing it from the shifts the worker would use.
                 if final_shape is None:
