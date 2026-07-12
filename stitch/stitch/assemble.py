@@ -1385,19 +1385,20 @@ def assemble_streaming(
         y_hi = min(int(total_y), int(y_hi))
     else:
         y_lo, y_hi = 0, total_y
-    # Snap loop start to a multiple of ty so chunk-aligned stripes pick up
-    # only the bands fully inside their range.
+    # Clamp each band to y_lo (don't skip y0<y_lo) so a stripe boundary that
+    # isn't a multiple of ty still writes its straddling band, not blank rows.
     start = (y_lo // ty) * ty
     for y0 in range(start, y_hi, ty):
-        if y0 < y_lo:
-            continue
+        band_y0 = max(y0, y_lo)
         y1 = min(y_hi, y0 + ty)
+        if band_y0 >= y1:
+            continue
         y_tiles = [
             (nm, t_end, c_end, z_end, ys, ye, xs, xe)
             for (nm, t_end, c_end, z_end, ys, ye, xs, xe) in tile_meta
-            if not (ye <= y0 or ys >= y1)
+            if not (ye <= band_y0 or ys >= y1)
         ]
-        y_bands.append((y0, y1, y_tiles))
+        y_bands.append((band_y0, y1, y_tiles))
     if not y_bands:
         print(f"[assemble.streaming] No bands in y_range={y_range}; nothing to do")
         return arr_out
