@@ -55,6 +55,42 @@ _band_write_submit_time = None  # wall-clock start of write submission
 _blosc_benchmark_done = False
 
 
+# ── Fused per-tile-touch accumulate kernels ──────────────────────────────────
+# Collapse the ~8 launches per touch (slice+cast+ne+mul+iadd_num+iadd_den ...)
+# into 1. The tile stays as uint16 through the slice; the kernel casts inline.
+# Compiled once per process; env-gated via OPS_ASSEMBLE_FUSED_ACCUM=1.
+_ACCUM_EDT_KERNEL = None
+_ACCUM_NOEDT_KERNEL = None
+
+
+def _build_accum_kernels():
+    global _ACCUM_EDT_KERNEL, _ACCUM_NOEDT_KERNEL
+    if _ACCUM_EDT_KERNEL is not None:
+        return
+    import cupy as _cp
+    _ACCUM_EDT_KERNEL = _cp.ElementwiseKernel(
+        in_params='uint16 block, float32 wloc, float32 num_in, float32 den_in',
+        out_params='float32 num_out, float32 den_out',
+        operation='''
+        float b = (float)block;
+        float w = (b != 0.0f) ? wloc : 0.0f;
+        num_out = num_in + b * w;
+        den_out = den_in + w;
+        ''',
+        name='ops_assemble_accum_edt_fused',
+    )
+    _ACCUM_NOEDT_KERNEL = _cp.ElementwiseKernel(
+        in_params='uint16 block, float32 num_in, float32 den_in',
+        out_params='float32 num_out, float32 den_out',
+        operation='''
+        float b = (float)block;
+        num_out = num_in + b;
+        den_out = den_in + ((b != 0.0f) ? 1.0f : 0.0f);
+        ''',
+        name='ops_assemble_accum_noedt_fused',
+    )
+
+
 # ── CPU / IO monitoring ──────────────────────────────────────────────────────
 from ops_utils.profiling.proc_monitor import start_monitor as _start_cpu_monitor
 
@@ -280,8 +316,50 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
             if xe > x0 and xs < x1:
                 tiles_by_xblock[x0].append(tm)
 
+    # Optional: upload every unique tile in this band to GPU once, then let the
+    # X-block loop slice on-device. Each tile straddles ~3-4 X-blocks, so the
+    # legacy path re-issues an H2D per touch (~1200-1600 tiny transfers per
+    # band). With batch upload, we do ~600 large H2Ds instead. Kernel-launch
+    # amplification in the accum inner loop shrinks accordingly. Env-gated so
+    # A/B is trivial.
+    _batch_upload = os.environ.get("OPS_ASSEMBLE_BATCH_UPLOAD", "0") == "1"
+    _fused_accum = (
+        os.environ.get("OPS_ASSEMBLE_FUSED_ACCUM", "0") == "1"
+        and _USING_CUPY
+    )
+    _gpu_tiles: dict = {}
+    _gpu_tile_weights = None
+    if _batch_upload:
+        _seen = set()
+        for tm in y_tiles:
+            name = tm[0]
+            if name in _seen or name not in tile_cache:
+                continue
+            _seen.add(name)
+            tile_full = tile_cache[name][0]
+            # Keep native dtype (uint16); cast to dtype_val at accum time.
+            # xp.asarray on a pinned numpy view is a single large H2D + reshape.
+            _gpu_tiles[name] = xp.asarray(tile_full)
+    if _fused_accum:
+        _build_accum_kernels()
+        if use_edt and tile_weights is not None:
+            # One H2D per band for weights instead of per-tile-touch. dtype_val
+            # is the accum dtype (float32); kernel expects float32 wloc.
+            _gpu_tile_weights = xp.asarray(tile_weights, dtype=dtype_val)
+
     t_accum_total = 0.0
     n_tiles_hit_total = 0
+    # Per-stage timing (env-gated). GPU-syncs each stage to get real wall.
+    _prof_stages = os.environ.get("OPS_ASSEMBLE_PROFILE_STAGES", "0") == "1"
+    _st_alloc = 0.0
+    _st_h2d = 0.0
+    _st_accum = 0.0
+    _st_norm = 0.0
+    _st_cast = 0.0
+    _st_yield_wait = 0.0
+    _n_h2d_calls = 0
+    _n_x_blocks_processed = 0
+    _bytes_h2d = 0
     for x0 in x_blocks:
         x1 = min(total_x, x0 + tx)
         x_tiles = tiles_by_xblock[x0]
@@ -292,11 +370,17 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
             xp.cuda.Device().synchronize()
             t_a = time.time()
 
+        if _prof_stages:
+            xp.cuda.Device().synchronize()
+            _st_t0 = time.time()
         numer = xp.zeros(
             (final_shape[0], final_shape[1], final_shape[2], band_h, x1 - x0),
             dtype=dtype_val,
         )
         denom = xp.zeros_like(numer, dtype=dtype_val)
+        if _prof_stages:
+            xp.cuda.Device().synchronize()
+            _st_alloc += time.time() - _st_t0
 
         for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in x_tiles:
             iy0 = max(y0, ys)
@@ -331,9 +415,45 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
                 slice(iy0 - ys, iy1 - ys),
                 slice(ix0 - xs, ix1 - xs),
             )
-            block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
+            if _prof_stages:
+                xp.cuda.Device().synchronize()
+                _t_h2d = time.time()
+            _tile_on_gpu = _gpu_tiles.get(tile_name)
+            _use_fused = _fused_accum and _tile_on_gpu is not None
+            if _use_fused:
+                # Fused-kernel path: keep tile as uint16, cast + accum inline.
+                block = _tile_on_gpu[tile_sl]
+            elif _tile_on_gpu is not None:
+                # D2D slice + cast. The tile was H2D'd once at band start; this
+                # touch is on-device and shares work with the ~3 other X-blocks
+                # that also touch this tile.
+                block = _tile_on_gpu[tile_sl].astype(dtype_val)
+            else:
+                block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
+            if _prof_stages:
+                xp.cuda.Device().synchronize()
+                _st_h2d += time.time() - _t_h2d
+                _n_h2d_calls += 1
+                _bytes_h2d += int(block.nbytes)
+                _t_acc = time.time()
 
-            if use_edt:
+            if _use_fused:
+                num_slice = numer[out_sl]
+                den_slice = denom[out_sl]
+                if use_edt:
+                    wloc = _gpu_tile_weights[
+                        (iy0 - ys):(iy1 - ys), (ix0 - xs):(ix1 - xs)
+                    ]
+                    _ACCUM_EDT_KERNEL(
+                        block, wloc, num_slice, den_slice,
+                        num_slice, den_slice,
+                    )
+                else:
+                    _ACCUM_NOEDT_KERNEL(
+                        block, num_slice, den_slice,
+                        num_slice, den_slice,
+                    )
+            elif use_edt:
                 wloc = tile_weights[
                     (iy0 - ys):(iy1 - ys), (ix0 - xs):(ix1 - xs)
                 ]
@@ -345,20 +465,44 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
             else:
                 numer[out_sl] += block
                 denom[out_sl] += (block != 0).astype(dtype_val)
+            if _prof_stages:
+                xp.cuda.Device().synchronize()
+                _st_accum += time.time() - _t_acc
             n_tiles_hit_total += 1
 
         # Normalize in-place and cast to output dtype so the D2H that follows
         # transfers half the bytes (uint16 vs float32 for LiveScreen).
+        if _prof_stages:
+            xp.cuda.Device().synchronize()
+            _t_norm = time.time()
         xp.maximum(denom, 1e-12, out=denom)
         xp.divide(numer, denom, out=numer)
         del denom
         xp.nan_to_num(numer, copy=False)
+        if _prof_stages:
+            xp.cuda.Device().synchronize()
+            _st_norm += time.time() - _t_norm
+            _t_cast = time.time()
         if numer.dtype != out_dtype:
             norm_x = numer.astype(out_dtype)
             del numer
         else:
             norm_x = numer
-        xp.get_default_memory_pool().free_all_blocks()
+        if _prof_stages:
+            xp.cuda.Device().synchronize()
+            _st_cast += time.time() - _t_cast
+        _n_x_blocks_processed += 1
+        # NOTE: previously called `xp.get_default_memory_pool().free_all_blocks()`
+        # here — that forced the pool to release every block after each X-block,
+        # so the next iteration's `xp.zeros(numer)` had to hit cudaMalloc again.
+        # For a 497-X-block band that meant ~500 alloc/free cycles × ~16 MB of
+        # numer+denom = ~8 GB of pointless churn per band. Removing the call
+        # lets cupy's memory pool reuse the freed pool blocks in-place. Peak
+        # GPU memory stays bounded by the largest in-flight numer/denom
+        # (~16 MB) since `del numer/denom` + reassignment above drops the refs.
+        # Set `OPS_ASSEMBLE_FREE_MP=1` to restore the old behavior.
+        if os.environ.get("OPS_ASSEMBLE_FREE_MP", "0") == "1":
+            xp.get_default_memory_pool().free_all_blocks()
 
         if profile:
             xp.cuda.Device().synchronize()
@@ -371,6 +515,21 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
         timings_out["n_tiles_hit"] = n_tiles_hit_total
         timings_out["alloc"] = 0.0
         timings_out["normalize"] = 0.0
+
+    if _prof_stages:
+        _total = _st_alloc + _st_h2d + _st_accum + _st_norm + _st_cast
+        _gb = _bytes_h2d / 1e9
+        _gbps = _gb / _st_h2d if _st_h2d > 0 else 0.0
+        print(
+            f"[xblock-prof] band y=[{y0},{y1})  x_blocks={_n_x_blocks_processed}  "
+            f"tiles_hit={n_tiles_hit_total}  h2d_calls={_n_h2d_calls}  "
+            f"alloc={_st_alloc*1000:.0f}ms  "
+            f"h2d={_st_h2d*1000:.0f}ms ({_gb:.2f}GB {_gbps:.2f}GB/s)  "
+            f"accum={_st_accum*1000:.0f}ms  "
+            f"norm={_st_norm*1000:.0f}ms  cast={_st_cast*1000:.0f}ms  "
+            f"total={_total*1000:.0f}ms",
+            flush=True,
+        )
 
 
 def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
@@ -1121,8 +1280,13 @@ def assemble_streaming(
         # direct writes produce bytes consistent with what the metadata claims).
         # ``arr_out.store.root`` = whole store root; ``arr_out.path`` = the
         # array's subpath inside it (e.g. "A/1/0/0"). Compose to the array dir.
+        # iohub's ImageArray wrapper (v0.5+) doesn't expose .store directly —
+        # unwrap via .native (the underlying zarr Array) when present.
         from pathlib import Path as _P
-        arr_root = _P(arr_out.store.root) / arr_out.path.strip("/")
+        _store = getattr(arr_out, "store", None)
+        if _store is None and hasattr(arr_out, "native"):
+            _store = arr_out.native.store
+        arr_root = _P(_store.root) / arr_out.path.strip("/")
         meta = json.loads((arr_root / "zarr.json").read_text())
         blosc_cfg = next(
             (c for c in meta["codecs"] if c.get("name") == "blosc"), None
