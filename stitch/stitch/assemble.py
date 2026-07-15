@@ -517,7 +517,7 @@ def _process_y_band_gpu(y0, y1, total_x, y_tiles, tile_cache, final_shape,
 def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
                            y0, y1, tx, total_x, _write_executor, _write_futures,
                            pinned_buffer=None,
-                           direct_write_config=None):
+                           direct_write_config=None, t_out=0):
     """Transfer GPU result to CPU on a dedicated stream, then submit zarr writes.
 
     Runs in a background thread so the main thread can start the next band's
@@ -568,27 +568,29 @@ def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
                 direct_write_config["chunk_root"],
                 direct_write_config["chunk_hw"],
                 direct_write_config["blosc_codec"],
-                y0, x0, block_cpu,
+                y0, x0, block_cpu, t_out,
             )
         else:
             fut = _write_executor.submit(
-                _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, block_cpu
+                _write_zarr_block, arr_out, final_shape, y0, y1, x0, x1, block_cpu, t_out
             )
         _write_futures.append(fut)
     del norm_cpu
 
 
-def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
+def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu, t_out=0):
     """Write a single normalized block to the output zarr array (via zarr API).
 
     Called from a background thread to overlap writes with GPU processing.
-    Returns (data_bytes, elapsed) for profiling.
+    ``t_out`` selects the output T index (for multi-timepoint stores where the
+    canvas is (N, C, Z, Y, X) and each timepoint writes its own T slice; default
+    0 = the single-T behavior). Returns (data_bytes, elapsed) for profiling.
     """
     t0 = time.time()
     data_bytes = norm_cpu.nbytes
     arr_out[
         (
-            slice(0, final_shape[0]),
+            slice(t_out, t_out + 1),
             slice(0, final_shape[1]),
             slice(0, final_shape[2]),
             slice(y0, y1),
@@ -599,7 +601,8 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu):
 
 
 def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
-                          blosc_codec, y0, x0, _write_executor, _write_futures):
+                          blosc_codec, y0, x0, _write_executor, _write_futures,
+                          t_out=0):
     """Per-X-block D2H + direct-chunk-write. Companion to `_process_y_band_gpu_xblock`.
 
     Runs in the D2H worker thread. Allocates a pinned numpy buffer sized
@@ -621,12 +624,12 @@ def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
     del pinned_buf
     fut = _write_executor.submit(
         _write_zarr_block_direct, chunk_root, chunk_hw, blosc_codec,
-        y0, x0, block_cpu,
+        y0, x0, block_cpu, t_out,
     )
     _write_futures.append(fut)
 
 
-def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu):
+def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu, t_out=0):
     """Write a chunk-aligned block to a zarr V3 array by writing chunk files
     directly — bypassing zarr's sync API which serializes on a shared asyncio
     event loop (probe measured ~5-8× write speedup vs the ``arr[slice] = data``
@@ -639,7 +642,8 @@ def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu
     ``y0``, ``x0``: element-space top-left of the band-x-block; must be chunk
         aligned (i.e. ``y0 % chunk_H == 0`` and ``x0 % chunk_W == 0``).
     ``norm_cpu``: ndarray of shape (T=1, C, Z=1, chunk_H, chunk_W). Each channel
-        becomes one chunk file at ``c/0/{C}/0/{Y_idx}/{X_idx}``.
+        becomes one chunk file at ``c/{t_out}/{C}/0/{Y_idx}/{X_idx}``.
+    ``t_out``: output T chunk index (multi-timepoint stores; default 0).
     """
     t0 = time.time()
     chunk_h, chunk_w = chunk_hw
@@ -663,7 +667,7 @@ def _write_zarr_block_direct(chunk_root, chunk_hw, blosc_codec, y0, x0, norm_cpu
         raw = chunk_arr.tobytes()
         payload = blosc_codec.encode(raw) if blosc_codec is not None else raw
         total_bytes += norm_cpu[0, c, 0].nbytes
-        chunk_path = f"{chunk_root}/c/0/{c}/0/{y_idx}/{x_idx}"
+        chunk_path = f"{chunk_root}/c/{t_out}/{c}/0/{y_idx}/{x_idx}"
         parent = chunk_path.rsplit("/", 1)[0]
         os.makedirs(parent, exist_ok=True)
         with open(chunk_path, "wb") as fh:
@@ -930,6 +934,7 @@ def assemble_streaming(
     xblock_scoped_gpu: bool = False,
     n_concurrent_bands: int = 1,
     y_range: Optional[Tuple[int, int]] = None,
+    t_out: int = 0,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -1238,6 +1243,7 @@ def assemble_streaming(
                             _direct_write_config["blosc_codec"],
                             y0_b, x0_x,
                             _write_executor, _write_futures,
+                            t_out,
                         )
                         d2h_futs.append(fut)
                     for f in d2h_futs:
@@ -1306,7 +1312,7 @@ def assemble_streaming(
                 arr_out, final_shape, y0, y1, tx, total_x,
                 _write_executor, _write_futures,
                 _pinned_buffer,
-                _direct_write_config,
+                _direct_write_config, t_out,
             )
 
             # Release freed GPU memory back to CUDA so other parallel wells
@@ -1413,7 +1419,7 @@ def assemble_streaming(
                 norm_cpu = _to_numpy(norm)
                 arr_out[
                     (
-                        slice(0, final_shape[0]),
+                        slice(t_out, t_out + 1),
                         slice(0, final_shape[1]),
                         slice(0, final_shape[2]),
                         slice(y0, y1),
