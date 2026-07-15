@@ -322,11 +322,17 @@ class DragonAwareConvertedTileSource(ConvertedTileSource):
                     self.server_queues[host].put(
                         ("batch_get", sub, self.channel, resp_q))
                     outstanding += 1
-            # Decode responses as they arrive (out-of-order OK).
+            # Decode responses as they arrive. Fetch server streams: each
+            # outstanding request emits ≥1 result chunk + a (host, None)
+            # sentinel. Count sentinels, not messages.
             codec = numcodecs.Blosc()
-            for _ in range(outstanding):
-                _host, result = resp_q.get()
-                for name, raw in result.items():
+            sentinels_seen = 0
+            while sentinels_seen < outstanding:
+                _host, chunk = resp_q.get()
+                if chunk is None:
+                    sentinels_seen += 1
+                    continue
+                for name, raw in chunk.items():
                     decoded = codec.decode(raw)
                     arr = np.frombuffer(decoded, dtype=self.dtype).reshape(
                         self.frame_shape)
@@ -343,13 +349,20 @@ class DragonAwareConvertedTileSource(ConvertedTileSource):
         entry = self.shard_map.get(name)
         if entry is None or entry[0] == self._my_host:
             return super()._fetch_one(name)
-        # Remote: one-off batch_get of size 1.
+        # Remote: one-off batch_get of size 1. Fetch server now streams
+        # results as (host, {names: raw, ...}) chunks terminated by
+        # (host, None) — drain until sentinel.
         host = entry[0]
         resp_q = self._get_response_queue()
         self.server_queues[host].put(
             ("batch_get", [name], self.channel, resp_q))
-        _host, result = resp_q.get()
-        raw = result[name]
+        merged: dict = {}
+        while True:
+            _host, chunk = resp_q.get()
+            if chunk is None:
+                break
+            merged.update(chunk)
+        raw = merged[name]
         codec = numcodecs.Blosc()
         decoded = codec.decode(raw)
         arr = np.frombuffer(decoded, dtype=self.dtype).reshape(self.frame_shape)
