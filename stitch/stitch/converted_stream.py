@@ -272,6 +272,12 @@ class DragonAwareConvertedTileSource(ConvertedTileSource):
     def _split_by_host(self, names):
         """Return (local_names, {remote_host: [names]})."""
         from collections import defaultdict
+        # OPS_ASSEMBLE_FORCE_LOCAL=1: skip shard_map routing; treat every FOV
+        # as local. Safe only when the caller guarantees each node's /tmp has
+        # the full converted store (see Y-partitioned / full-mirror convert).
+        import os as _os
+        if _os.environ.get("OPS_ASSEMBLE_FORCE_LOCAL", "0") == "1":
+            return list(names), {}
         local: list[str] = []
         remote: dict[str, list[str]] = defaultdict(list)
         for name in names:
