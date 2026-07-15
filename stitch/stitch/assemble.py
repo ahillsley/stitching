@@ -91,6 +91,32 @@ def _build_accum_kernels():
     )
 
 
+# ── Fused normalize + cast kernel ────────────────────────────────────────────
+# Replaces (xp.maximum, xp.divide, xp.nan_to_num, .astype) = 4 kernel launches
+# per X-block with 1. Applies to the uint16-out common case; float32-out
+# falls through to the legacy path.
+_NORM_CAST_U16_KERNEL = None
+
+
+def _build_norm_cast_kernel():
+    global _NORM_CAST_U16_KERNEL
+    if _NORM_CAST_U16_KERNEL is not None:
+        return
+    import cupy as _cp
+    _NORM_CAST_U16_KERNEL = _cp.ElementwiseKernel(
+        in_params='float32 numer, float32 denom',
+        out_params='uint16 out',
+        operation='''
+        float d = (denom > 1e-12f) ? denom : 1e-12f;
+        float v = numer / d;
+        v = isfinite(v) ? v : 0.0f;
+        v = v < 0.0f ? 0.0f : (v > 65535.0f ? 65535.0f : v);
+        out = (unsigned short)v;
+        ''',
+        name='ops_assemble_norm_cast_u16',
+    )
+
+
 # ── Batched RawKernel — one launch per X-block for all K tile-touches ───────
 # The fused ElementwiseKernel above is still called once per tile-touch, so the
 # Python for-loop iterating touches dominates when per-band mean drops below
@@ -673,24 +699,41 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
                     _st_accum += time.time() - _t_acc
                 n_tiles_hit_total += 1
 
-        # Normalize in-place and cast to output dtype so the D2H that follows
-        # transfers half the bytes (uint16 vs float32 for LiveScreen).
+        # Normalize + cast. Fused single-kernel path for uint16 output (the
+        # LiveScreen case) — replaces 4 launches (maximum, divide, nan_to_num,
+        # astype) with 1. Env-gated OPS_ASSEMBLE_FUSED_NORMCAST=1.
+        _fused_normcast = (
+            os.environ.get("OPS_ASSEMBLE_FUSED_NORMCAST", "0") == "1"
+            and _USING_CUPY
+            and out_dtype == xp.uint16
+        )
         if _prof_stages:
             xp.cuda.Device().synchronize()
             _t_norm = time.time()
-        xp.maximum(denom, 1e-12, out=denom)
-        xp.divide(numer, denom, out=numer)
-        del denom
-        xp.nan_to_num(numer, copy=False)
-        if _prof_stages:
-            xp.cuda.Device().synchronize()
-            _st_norm += time.time() - _t_norm
-            _t_cast = time.time()
-        if numer.dtype != out_dtype:
-            norm_x = numer.astype(out_dtype)
-            del numer
+        if _fused_normcast:
+            _build_norm_cast_kernel()
+            norm_x = xp.empty(numer.shape, dtype=out_dtype)
+            _NORM_CAST_U16_KERNEL(numer, denom, norm_x)
+            del numer, denom
+            if _prof_stages:
+                xp.cuda.Device().synchronize()
+                _st_norm += time.time() - _t_norm
+                _t_cast = time.time()
+                # keep _st_cast at 0 in fused path; norm captures everything
         else:
-            norm_x = numer
+            xp.maximum(denom, 1e-12, out=denom)
+            xp.divide(numer, denom, out=numer)
+            del denom
+            xp.nan_to_num(numer, copy=False)
+            if _prof_stages:
+                xp.cuda.Device().synchronize()
+                _st_norm += time.time() - _t_norm
+                _t_cast = time.time()
+            if numer.dtype != out_dtype:
+                norm_x = numer.astype(out_dtype)
+                del numer
+            else:
+                norm_x = numer
         if _prof_stages:
             xp.cuda.Device().synchronize()
             _st_cast += time.time() - _t_cast
