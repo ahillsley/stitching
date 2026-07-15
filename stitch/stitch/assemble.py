@@ -935,6 +935,7 @@ def assemble_streaming(
     n_concurrent_bands: int = 1,
     y_range: Optional[Tuple[int, int]] = None,
     t_out: int = 0,
+    block_hook=None,
 ):
     """Streamed assembly that avoids saving auxiliary arrays.
 
@@ -1232,6 +1233,11 @@ def assemble_streaming(
                     )
                     d2h_futs = []
                     for x0_x, x1_x, norm_gpu_x in gen_b:
+                        # Optional per-block hook (e.g. level-1 pyramid fusion):
+                        # fold this L0 block into downsampled outputs BEFORE the
+                        # async L0 D2H frees norm_gpu_x. Runs on this band's stream.
+                        if block_hook is not None:
+                            block_hook(y0_b, x0_x, norm_gpu_x)
                         _MAX_WRITE_FUTURES = 5000
                         while len(_write_futures) > _MAX_WRITE_FUTURES:
                             _write_futures[0].result()
@@ -1474,6 +1480,9 @@ def assemble_streaming(
     t_drain_elapsed = time.time() - t_drain_start
     print(f"  [Write drain] Waited {t_drain_elapsed:.2f}s for {len(_write_futures)} background writes"
           f"{f' ({n_failed} failed)' if n_failed else ''}")
+
+    if block_hook is not None and hasattr(block_hook, "finalize"):
+        block_hook.finalize()
 
     return arr_out
 
