@@ -91,6 +91,75 @@ def _build_accum_kernels():
     )
 
 
+# ── Batched RawKernel — one launch per X-block for all K tile-touches ───────
+# The fused ElementwiseKernel above is still called once per tile-touch, so the
+# Python for-loop iterating touches dominates when per-band mean drops below
+# ~4s. This kernel does one launch per X-block that internally iterates all K
+# tile-touches, eliminating the Python round-trip per touch.
+#
+# Requirements: OPS_ASSEMBLE_BATCH_UPLOAD=1 so tiles are already on GPU; only
+# EDT path implemented (LiveScreen's). Falls back to fused/legacy otherwise.
+_BATCHED_ACCUM_EDT_KERNEL = None
+
+
+_BATCHED_ACCUM_EDT_SRC = r'''
+extern "C" __global__ void batched_accum_edt(
+    const unsigned short* __restrict__ tile_stack, // (N_unique, TCZ, tile_H, tile_W) uint16
+    const float*          __restrict__ tile_weights, // (tile_H, tile_W) float32
+    const int* __restrict__ src_y,                 // (K,) tile-local start y
+    const int* __restrict__ src_x,                 // (K,) tile-local start x
+    const int* __restrict__ dst_y,                 // (K,) band-local start y in numer
+    const int* __restrict__ dst_x,                 // (K,) xblock-local start x in numer
+    const int* __restrict__ oh,                    // (K,) overlap height
+    const int* __restrict__ ow,                    // (K,) overlap width
+    const int* __restrict__ ti,                    // (K,) index into tile_stack
+    int K, int TCZ, int band_h, int x_width,
+    int tile_H, int tile_W,
+    float* __restrict__ numer,                     // (TCZ, band_h, x_width) float32
+    float* __restrict__ denom                      // (TCZ, band_h, x_width) float32
+) {
+    int k  = blockIdx.x;
+    int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    int ox = blockIdx.z * blockDim.z + threadIdx.z;
+    if (k >= K) return;
+    int this_oh = oh[k];
+    int this_ow = ow[k];
+    if (oy >= this_oh || ox >= this_ow) return;
+
+    int syy    = src_y[k] + oy;
+    int sxx    = src_x[k] + ox;
+    int dyy    = dst_y[k] + oy;
+    int dxx    = dst_x[k] + ox;
+    int tile_i = ti[k];
+
+    float          w    = tile_weights[(long long)syy * tile_W + sxx];
+    long long      spx  = (long long)tile_H * tile_W;      // per-plane stride in tile
+    long long      dpx  = (long long)band_h * x_width;     // per-plane stride in numer/denom
+    long long      src0 = (long long)tile_i * TCZ * spx + (long long)syy * tile_W + sxx;
+    long long      dst0 = (long long)dyy * x_width + dxx;
+
+    for (int c = 0; c < TCZ; c++) {
+        long long src = src0 + c * spx;
+        long long dst = dst0 + c * dpx;
+        float b = (float)tile_stack[src];
+        float eff_w = (b != 0.0f) ? w : 0.0f;
+        atomicAdd(&numer[dst], b * eff_w);
+        atomicAdd(&denom[dst], eff_w);
+    }
+}
+'''
+
+
+def _build_batched_kernel():
+    global _BATCHED_ACCUM_EDT_KERNEL
+    if _BATCHED_ACCUM_EDT_KERNEL is not None:
+        return
+    import cupy as _cp
+    _BATCHED_ACCUM_EDT_KERNEL = _cp.RawKernel(
+        _BATCHED_ACCUM_EDT_SRC, 'batched_accum_edt',
+    )
+
+
 # ── CPU / IO monitoring ──────────────────────────────────────────────────────
 from ops_utils.profiling.proc_monitor import start_monitor as _start_cpu_monitor
 
@@ -327,8 +396,16 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
         os.environ.get("OPS_ASSEMBLE_FUSED_ACCUM", "0") == "1"
         and _USING_CUPY
     )
+    _batched_kernel_env = (
+        os.environ.get("OPS_ASSEMBLE_BATCHED_KERNEL", "0") == "1"
+        and _USING_CUPY and _batch_upload and use_edt
+    )
     _gpu_tiles: dict = {}
     _gpu_tile_weights = None
+    _tile_stack = None
+    _tile_name_to_idx: dict = {}
+    _tile_H = _tile_W = _TCZ = 0
+    _batched_kernel_active = False
     if _batch_upload:
         _seen = set()
         for tm in y_tiles:
@@ -346,6 +423,68 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
             # One H2D per band for weights instead of per-tile-touch. dtype_val
             # is the accum dtype (float32); kernel expects float32 wloc.
             _gpu_tile_weights = xp.asarray(tile_weights, dtype=dtype_val)
+    if _batched_kernel_env and _gpu_tiles:
+        # Build a stacked (N_unique, TCZ, tile_H, tile_W) uint16 tensor so the
+        # batched kernel can index tiles by integer id. Requires uniform tile
+        # shape AND tile_weights shape matching (tile_H, tile_W). Any mismatch
+        # falls back to fused-per-touch (prior MMU-fault crash was from a shape
+        # mismatch that let the kernel read past the end of tile_weights).
+        _names = list(_gpu_tiles.keys())
+        _ref = _gpu_tiles[_names[0]]
+        _all_uniform = _ref.dtype == xp.uint16 and all(
+            _gpu_tiles[n].shape == _ref.shape and _gpu_tiles[n].dtype == xp.uint16
+            for n in _names
+        )
+        if _all_uniform:
+            _tile_H = int(_ref.shape[-2])
+            _tile_W = int(_ref.shape[-1])
+            # Collapse leading (T, C, Z) dims into a single TCZ axis so the
+            # kernel sees (N_unique, TCZ, H, W). LiveScreen: T=1, C=5, Z=1 → TCZ=5.
+            _TCZ = int(_ref.size // (_tile_H * _tile_W))
+            # Validate tile_weights: must be exactly (tile_H, tile_W) so the
+            # kernel's `tile_weights[syy * tile_W + sxx]` is in bounds.
+            _tw_ok = (
+                tile_weights is not None
+                and tile_weights.ndim == 2
+                and tile_weights.shape[0] == _tile_H
+                and tile_weights.shape[1] == _tile_W
+            )
+            if not _tw_ok:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[batched-kernel] disabling: tile_weights.shape="
+                    f"{None if tile_weights is None else tile_weights.shape} "
+                    f"tile_H={_tile_H} tile_W={_tile_W}\n"
+                )
+                _sys.stderr.flush()
+            else:
+                # Force each tile contiguous before reshape so stack sees a
+                # sane C-order layout.
+                _tile_stack = xp.stack([
+                    xp.ascontiguousarray(_gpu_tiles[n]).reshape(
+                        _TCZ, _tile_H, _tile_W
+                    ) for n in _names
+                ], axis=0)
+                _tile_stack = xp.ascontiguousarray(_tile_stack)
+                _tile_name_to_idx = {n: i for i, n in enumerate(_names)}
+                if _gpu_tile_weights is None:
+                    _gpu_tile_weights = xp.asarray(tile_weights, dtype=dtype_val)
+                _gpu_tile_weights = xp.ascontiguousarray(_gpu_tile_weights)
+                _build_batched_kernel()
+                _batched_kernel_active = True
+                # One-shot info print per band so if we OOB later we know the
+                # geometry.
+                if band_h > 0 and not getattr(_process_y_band_gpu_xblock,
+                                              "_bk_shape_printed", False):
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[batched-kernel] active: N={len(_names)} "
+                        f"TCZ={_TCZ} tile_H={_tile_H} tile_W={_tile_W} "
+                        f"tile_stack={_tile_stack.shape} "
+                        f"weights={_gpu_tile_weights.shape} band_h={band_h}\n"
+                    )
+                    _sys.stderr.flush()
+                    _process_y_band_gpu_xblock._bk_shape_printed = True
 
     t_accum_total = 0.0
     n_tiles_hit_total = 0
@@ -382,93 +521,157 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
             xp.cuda.Device().synchronize()
             _st_alloc += time.time() - _st_t0
 
-        for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in x_tiles:
-            iy0 = max(y0, ys)
-            iy1 = min(y1, ye)
-            ix0 = max(x0, xs)
-            ix1 = min(x1, xe)
-            if ix0 >= ix1 or iy0 >= iy1:
-                continue
-
-            if tile_name not in tile_cache:
-                y_names_sample = [t[0] for t in y_tiles[:5]]
-                cache_sample = list(tile_cache.keys())[:5]
-                import sys as _sys
-                _sys.stderr.write(
-                    f"\n[xblock DEBUG] MISS tile_name={tile_name!r} "
-                    f"y0={y0} y1={y1} x0={x0} x1={x1} "
-                    f"y_tiles_len={len(y_tiles)} tile_cache_size={len(tile_cache)}\n"
-                    f"  y_tiles head: {y_names_sample}\n"
-                    f"  tile_cache head: {cache_sample}\n"
+        if _batched_kernel_active:
+            # Gather per-touch metadata for this X-block in one pass, then do
+            # ONE kernel launch that iterates all K tile-touches internally.
+            # Eliminates the Python for-loop overhead (~400 μs/touch) that
+            # dominates when per-band mean falls below ~4 s.
+            _src_y = []
+            _src_x = []
+            _dst_y = []
+            _dst_x = []
+            _oh    = []
+            _ow    = []
+            _ti    = []
+            for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in x_tiles:
+                iy0 = max(y0, ys)
+                iy1 = min(y1, ye)
+                ix0 = max(x0, xs)
+                ix1 = min(x1, xe)
+                if ix0 >= ix1 or iy0 >= iy1:
+                    continue
+                _src_y.append(iy0 - ys)
+                _src_x.append(ix0 - xs)
+                _dst_y.append(iy0 - y0)
+                _dst_x.append(ix0 - x0)
+                _oh.append(iy1 - iy0)
+                _ow.append(ix1 - ix0)
+                _ti.append(_tile_name_to_idx[tile_name])
+            K = len(_src_y)
+            if K > 0:
+                _sy = xp.asarray(_src_y, dtype=xp.int32)
+                _sx = xp.asarray(_src_x, dtype=xp.int32)
+                _dy = xp.asarray(_dst_y, dtype=xp.int32)
+                _dx = xp.asarray(_dst_x, dtype=xp.int32)
+                _ohg = xp.asarray(_oh,   dtype=xp.int32)
+                _owg = xp.asarray(_ow,   dtype=xp.int32)
+                _tig = xp.asarray(_ti,   dtype=xp.int32)
+                _max_oh = max(_oh)
+                _max_ow = max(_ow)
+                _by, _bx = 16, 16
+                grid = (
+                    K,
+                    (_max_oh + _by - 1) // _by,
+                    (_max_ow + _bx - 1) // _bx,
                 )
-                _sys.stderr.flush()
-            tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
-            # Output slice is X-block-local (not band-global): the caller receives
-            # an array of shape (T, C, Z, band_h, x1 - x0) starting at column 0.
-            out_sl = (
-                slice(0, t_end), slice(0, c_end), slice(0, z_end),
-                slice(iy0 - y0, iy1 - y0),
-                slice(ix0 - x0, ix1 - x0),
-            )
-            tile_sl = (
-                slice(0, t_end), slice(0, c_end), slice(0, z_end),
-                slice(iy0 - ys, iy1 - ys),
-                slice(ix0 - xs, ix1 - xs),
-            )
+                block = (1, _by, _bx)
+                # numer/denom are (T, C, Z, band_h, x_width). The kernel sees
+                # them flattened as (TCZ, band_h, x_width).
+                _numer_flat = numer.reshape(_TCZ, band_h, x1 - x0)
+                _denom_flat = denom.reshape(_TCZ, band_h, x1 - x0)
+                _BATCHED_ACCUM_EDT_KERNEL(
+                    grid, block,
+                    (
+                        _tile_stack, _gpu_tile_weights,
+                        _sy, _sx, _dy, _dx, _ohg, _owg, _tig,
+                        np.int32(K), np.int32(_TCZ),
+                        np.int32(band_h), np.int32(x1 - x0),
+                        np.int32(_tile_H), np.int32(_tile_W),
+                        _numer_flat, _denom_flat,
+                    ),
+                )
+                n_tiles_hit_total += K
             if _prof_stages:
                 xp.cuda.Device().synchronize()
-                _t_h2d = time.time()
-            _tile_on_gpu = _gpu_tiles.get(tile_name)
-            _use_fused = _fused_accum and _tile_on_gpu is not None
-            if _use_fused:
-                # Fused-kernel path: keep tile as uint16, cast + accum inline.
-                block = _tile_on_gpu[tile_sl]
-            elif _tile_on_gpu is not None:
-                # D2D slice + cast. The tile was H2D'd once at band start; this
-                # touch is on-device and shares work with the ~3 other X-blocks
-                # that also touch this tile.
-                block = _tile_on_gpu[tile_sl].astype(dtype_val)
-            else:
-                block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
-            if _prof_stages:
-                xp.cuda.Device().synchronize()
-                _st_h2d += time.time() - _t_h2d
-                _n_h2d_calls += 1
-                _bytes_h2d += int(block.nbytes)
-                _t_acc = time.time()
+                _st_accum += time.time() - _st_t0
+        else:
+            for tile_name, t_end, c_end, z_end, ys, ye, xs, xe in x_tiles:
+                iy0 = max(y0, ys)
+                iy1 = min(y1, ye)
+                ix0 = max(x0, xs)
+                ix1 = min(x1, xe)
+                if ix0 >= ix1 or iy0 >= iy1:
+                    continue
 
-            if _use_fused:
-                num_slice = numer[out_sl]
-                den_slice = denom[out_sl]
-                if use_edt:
-                    wloc = _gpu_tile_weights[
+                if tile_name not in tile_cache:
+                    y_names_sample = [t[0] for t in y_tiles[:5]]
+                    cache_sample = list(tile_cache.keys())[:5]
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"\n[xblock DEBUG] MISS tile_name={tile_name!r} "
+                        f"y0={y0} y1={y1} x0={x0} x1={x1} "
+                        f"y_tiles_len={len(y_tiles)} tile_cache_size={len(tile_cache)}\n"
+                        f"  y_tiles head: {y_names_sample}\n"
+                        f"  tile_cache head: {cache_sample}\n"
+                    )
+                    _sys.stderr.flush()
+                tile_full, t_end, c_end, z_end, ys, ye, xs, xe = tile_cache[tile_name]
+                # Output slice is X-block-local (not band-global): the caller receives
+                # an array of shape (T, C, Z, band_h, x1 - x0) starting at column 0.
+                out_sl = (
+                    slice(0, t_end), slice(0, c_end), slice(0, z_end),
+                    slice(iy0 - y0, iy1 - y0),
+                    slice(ix0 - x0, ix1 - x0),
+                )
+                tile_sl = (
+                    slice(0, t_end), slice(0, c_end), slice(0, z_end),
+                    slice(iy0 - ys, iy1 - ys),
+                    slice(ix0 - xs, ix1 - xs),
+                )
+                if _prof_stages:
+                    xp.cuda.Device().synchronize()
+                    _t_h2d = time.time()
+                _tile_on_gpu = _gpu_tiles.get(tile_name)
+                _use_fused = _fused_accum and _tile_on_gpu is not None
+                if _use_fused:
+                    # Fused-kernel path: keep tile as uint16, cast + accum inline.
+                    block = _tile_on_gpu[tile_sl]
+                elif _tile_on_gpu is not None:
+                    # D2D slice + cast. The tile was H2D'd once at band start; this
+                    # touch is on-device and shares work with the ~3 other X-blocks
+                    # that also touch this tile.
+                    block = _tile_on_gpu[tile_sl].astype(dtype_val)
+                else:
+                    block = xp.asarray(tile_full[tile_sl], dtype=dtype_val)
+                if _prof_stages:
+                    xp.cuda.Device().synchronize()
+                    _st_h2d += time.time() - _t_h2d
+                    _n_h2d_calls += 1
+                    _bytes_h2d += int(block.nbytes)
+                    _t_acc = time.time()
+
+                if _use_fused:
+                    num_slice = numer[out_sl]
+                    den_slice = denom[out_sl]
+                    if use_edt:
+                        wloc = _gpu_tile_weights[
+                            (iy0 - ys):(iy1 - ys), (ix0 - xs):(ix1 - xs)
+                        ]
+                        _ACCUM_EDT_KERNEL(
+                            block, wloc, num_slice, den_slice,
+                            num_slice, den_slice,
+                        )
+                    else:
+                        _ACCUM_NOEDT_KERNEL(
+                            block, num_slice, den_slice,
+                            num_slice, den_slice,
+                        )
+                elif use_edt:
+                    wloc = tile_weights[
                         (iy0 - ys):(iy1 - ys), (ix0 - xs):(ix1 - xs)
                     ]
-                    _ACCUM_EDT_KERNEL(
-                        block, wloc, num_slice, den_slice,
-                        num_slice, den_slice,
-                    )
+                    wloc = xp.asarray(wloc, dtype=dtype_val)
+                    nz = block != 0
+                    wloc = wloc * nz
+                    numer[out_sl] += block * wloc
+                    denom[out_sl] += wloc
                 else:
-                    _ACCUM_NOEDT_KERNEL(
-                        block, num_slice, den_slice,
-                        num_slice, den_slice,
-                    )
-            elif use_edt:
-                wloc = tile_weights[
-                    (iy0 - ys):(iy1 - ys), (ix0 - xs):(ix1 - xs)
-                ]
-                wloc = xp.asarray(wloc, dtype=dtype_val)
-                nz = block != 0
-                wloc = wloc * nz
-                numer[out_sl] += block * wloc
-                denom[out_sl] += wloc
-            else:
-                numer[out_sl] += block
-                denom[out_sl] += (block != 0).astype(dtype_val)
-            if _prof_stages:
-                xp.cuda.Device().synchronize()
-                _st_accum += time.time() - _t_acc
-            n_tiles_hit_total += 1
+                    numer[out_sl] += block
+                    denom[out_sl] += (block != 0).astype(dtype_val)
+                if _prof_stages:
+                    xp.cuda.Device().synchronize()
+                    _st_accum += time.time() - _t_acc
+                n_tiles_hit_total += 1
 
         # Normalize in-place and cast to output dtype so the D2H that follows
         # transfers half the bytes (uint16 vs float32 for LiveScreen).
