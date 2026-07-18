@@ -1011,6 +1011,15 @@ def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
     exactly to ``norm_gpu_x.shape`` (guaranteed contiguous), D2Hs into it,
     then copies out and submits the direct chunk write. Cupy's pinned memory
     pool caches allocations, so repeated calls with the same shape are cheap.
+
+    NOTE: the D2H is enqueued on a non-blocking stream, then the source GPU
+    tensor is released to CuPy's pool and `free_all_blocks()` cudaFrees the
+    pool's cached blocks. If we do not synchronize the stream first, that
+    cudaFree can run BEFORE the async copy has drained the source, and the
+    pinned_buf.copy() below reads garbage (all-zero when the pinned buffer
+    was freshly allocated). Reproduced as ~5–7 empty output chunks at random
+    (Y, X) locations under K=2 workers/GPU where compute concurrency stalls
+    the D2H enough to lose the race; disappears at K=1.
     """
     import cupyx
     with transfer_stream:
@@ -1018,6 +1027,9 @@ def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
         # Pool-cached across calls with matching shape/dtype.
         pinned_buf = cupyx.empty_pinned(norm_gpu_x.shape, dtype=norm_gpu_x.dtype)
         norm_gpu_x.get(out=pinned_buf)
+    # Wait for the async D2H to complete before releasing the source tensor
+    # and returning pool memory to CUDA — see NOTE above.
+    transfer_stream.synchronize()
     del norm_gpu_x
     xp.get_default_memory_pool().free_all_blocks()
     # Copy payload out of pinned memory so the write pool doesn't pin it —
