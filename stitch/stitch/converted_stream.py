@@ -66,17 +66,25 @@ class ConvertedTileSource:
     def __init__(self, store_root, *, channel: int = 0,
                  flipud: bool = False, fliplr: bool = False, rot90: int = 0,
                  frame_shape: tuple[int, int] | None = None,
-                 dtype: str = "uint16"):
+                 dtype: str = "uint16",
+                 well_id: str = "A/1"):
         self.store_root = Path(store_root)
         self.channel = int(channel)
         self.flipud = bool(flipud)
         self.fliplr = bool(fliplr)
         self.rot90 = int(rot90) % 4
+        # Which HCS well this source reads (single-well per instance). Slash
+        # form ("A/1") — split into (row, col) for path construction.
+        _wparts = well_id.strip().split("/", 1)
+        if len(_wparts) != 2:
+            raise ValueError(f"well_id must be '<row>/<col>' (got {well_id!r})")
+        self.well_id = f"{_wparts[0]}/{_wparts[1]}"
+        self._well_path = self.store_root / _wparts[0] / _wparts[1]
 
         # Peek at a sample tile's zarr.json to confirm chunk shape + dtype.
         # Matches assemble_gpu's _build_direct_chunk_tile_loader flow.
         if frame_shape is None:
-            sample_dir = next(self.store_root.glob("A/1/*/0"))
+            sample_dir = next(self._well_path.glob("*/0"))
             with open(sample_dir / "zarr.json") as fh:
                 meta = json.load(fh)
             chunk_shape = tuple(meta["chunk_grid"]["configuration"]["chunk_shape"])
@@ -99,7 +107,7 @@ class ConvertedTileSource:
     def _fetch_one(self, name: str) -> np.ndarray:
         """Actually read + decode + augment. Not cached — for direct call sites."""
         chunk_path = (
-            self.store_root / "A" / "1" / name / "0"
+            self._well_path / name / "0"
             / "c" / "0" / str(self.channel) / "0" / "0" / "0"
         )
         # numcodecs.Blosc holds an internal decompression context that is NOT
@@ -162,7 +170,8 @@ class ConvertedTileSource:
 # this node, or fetches over Dragon HSTA when it lives on another node.
 # --------------------------------------------------------------------------
 
-def dragon_fetch_server(local_out_path: str, in_queue, ready_event):
+def dragon_fetch_server(local_out_path: str, in_queue, ready_event,
+                        well_id: str = "A/1"):
     """Runs on each allocated node as a Dragon Process. Serves incoming
     FOV chunk requests by reading the requested channel's chunk file
     from LOCAL /tmp and returning raw (still-Blosc-encoded) bytes.
@@ -187,7 +196,8 @@ def dragon_fetch_server(local_out_path: str, in_queue, ready_event):
     from concurrent.futures import as_completed
 
     host = socket.gethostname()
-    root = Path(local_out_path)
+    _wparts = well_id.strip().split("/", 1)
+    root = Path(local_out_path) / _wparts[0] / _wparts[1]
     ready_event.set()
     n_served = 0
     # Multi-threaded per-batch reads. Peer nodes send batch_gets of hundreds of
@@ -210,7 +220,7 @@ def dragon_fetch_server(local_out_path: str, in_queue, ready_event):
             continue
         _, names, channel, response_queue = msg
         def _read_one(name):
-            chunk_path = (root / "A" / "1" / name / "0"
+            chunk_path = (root / name / "0"
                           / "c" / "0" / str(channel) / "0" / "0" / "0")
             with open(chunk_path, "rb") as fh:
                 return name, fh.read()
