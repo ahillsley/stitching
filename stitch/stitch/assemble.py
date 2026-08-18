@@ -754,6 +754,22 @@ def _process_y_band_gpu_xblock(y0, y1, total_x, y_tiles, tile_cache, final_shape
             xp.cuda.Device().synchronize()
             t_accum_total += time.time() - t_a
 
+        # Cross-stream sync: the astype(int32) at line ~733 runs on the caller's
+        # compute stream (via `with stream_b:` in `_run_one_band_xblock`), but
+        # `_d2h_and_write_xblock` initiates the D2H on `transfer_stream`. Streams
+        # are asynchronous with each other — under GPU contention (K=2+ mask_band
+        # processes sharing one GPU via MPS), the D2H can begin reading GPU
+        # memory BEFORE the astype has drained, copying the pre-cast float32
+        # numer bytes into pinned host memory instead of the int32 output. On
+        # disk the int32 chunk then contains float32 bit-patterns → ~1e9 "labels"
+        # (see anti_pattern_assemble_gpu_mask_junk_labels). Synchronizing the
+        # compute stream here ensures the cast is complete before we yield.
+        # Cost: forces the compute→D2H pipeline to serialize per x-block, but
+        # each astype is ~sub-ms so overhead is negligible; K=1 correctness
+        # already proves the write path is race-free once the sync holds.
+        if _USING_CUPY:
+            xp.cuda.get_current_stream().synchronize()
+
         yield x0, x1, norm_x
 
     if profile and timings_out is not None:
