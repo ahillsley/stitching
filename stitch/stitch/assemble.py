@@ -1136,10 +1136,24 @@ def assemble_streaming(
         )
         # Read the array's zarr.json to reconstruct the blosc codec (so our
         # direct writes produce bytes consistent with what the metadata claims).
-        # ``arr_out.store.root`` = whole store root; ``arr_out.path`` = the
-        # array's subpath inside it (e.g. "A/1/0/0"). Compose to the array dir.
+        # ``store.root`` = whole store root; ``.path`` = the array's subpath
+        # inside it (e.g. "A/1/0/0"). Compose to the array dir. iohub 0.3.x
+        # ImageArrays expose .store/.path via .native, not directly (raw zarr
+        # arrays have them directly) — walk both. (Compat fix from origin/main.)
         from pathlib import Path as _P
-        arr_root = _P(arr_out.store.root) / arr_out.path.strip("/")
+        _store, _arr_path = None, ""
+        for _src in (arr_out, getattr(arr_out, "native", None)):
+            if _src is None:
+                continue
+            _s = getattr(_src, "store", None)
+            if _s is not None:
+                _store = _s
+                _arr_path = getattr(_src, "path", "") or ""
+                break
+        _root = getattr(_store, "root", None)
+        if _root is None:
+            _root = getattr(_store, "path", None)
+        arr_root = _P(str(_root)) / _arr_path.strip("/")
         meta = json.loads((arr_root / "zarr.json").read_text())
         blosc_cfg = next(
             (c for c in meta["codecs"] if c.get("name") == "blosc"), None
