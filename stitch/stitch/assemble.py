@@ -2197,6 +2197,23 @@ def assemble_streaming(
         _n_c = int(final_shape[1])
         _fill = int(getattr(arr_out, "fill_value", 0) or 0)
 
+        # Direct-shard-encode writes a whole shard file with one open("wb").write(): it maps
+        # this band to shard row ``_y_lo // _sh_h`` and places data at intra-shard rows
+        # ``[0:_y_hi-_y_lo]``. That is only correct when the band starts on a shard boundary
+        # and spans at most one shard row. If the caller's y_range is mis-aligned or taller
+        # than a shard, two workers can target the same shard file (last writer wins, dropping
+        # chunks) or data lands at the wrong offset -- and the CRC still validates, so it reads
+        # back silently wrong. The ops_process partition (assemble_gpu_multi) guarantees this;
+        # assert it rather than trust the coupling across repos.
+        assert _y_lo % _sh_h == 0, (
+            f"direct-shard-encode needs a shard-aligned band: y_lo={_y_lo} not a multiple of "
+            f"shard height {_sh_h} (fix the worker Y-band partition)"
+        )
+        assert _y_hi - _y_lo <= _sh_h, (
+            f"direct-shard-encode needs band <= one shard row: y_span={_y_hi - _y_lo} > "
+            f"shard height {_sh_h} (fix the worker Y-band partition)"
+        )
+
         # Detect codec config: read the inner compression codec from
         # zarr.json. We support raw ``zstd`` and ``blosc`` (which internally
         # uses SIMD + threading, ~2-3x faster on integer data with bitshuffle).
