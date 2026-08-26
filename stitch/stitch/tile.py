@@ -16,8 +16,51 @@ from dexp.processing.registration.model.translation_registration_model import (
 )
 from dexp.processing.registration import translation_nd as dexp_reg
 from dexp.processing.utils.linear_solver import linsolve
+
+# Silence arbol's per-call "Memory pool clearing not enabled!" print (fires
+# every dexp CupyBackend.__exit__, so once per phase-correlation call — floods
+# stdout with 334k lines on a full plate). We don't rely on arbol output.
+try:
+    from arbol.arbol import Arbol as _Arbol
+    _Arbol.enable_output = False
+except Exception:
+    pass
 from stitch.connect import parse_positions, pos_to_name
 from stitch.stitch.graph import connectivity, hilbert_over_points
+
+# CuPy needs CUDA_PATH for runtime kernel compilation (NVRTC reads headers
+# from <CUDA_PATH>/include). Our uv .venv doesn't set it, so try in order:
+# (a) venv-bundled nvidia/cuda_nvcc wheel (matches organelle_profiler's shim),
+# (b) system CUDA toolkit matching PyTorch's CUDA version under /hpc/apps/x86_64/cuda.
+# Must run BEFORE `import cupy` — cupy imports fine without it, but the first
+# runtime kernel compile (e.g. our FFT/reduction path) will crash otherwise.
+import os as _os
+if "CUDA_PATH" not in _os.environ:
+    _cuda_path = None
+    try:
+        import importlib.util as _iu
+        _spec = _iu.find_spec("nvidia.cuda_nvcc")
+        if _spec is not None and _spec.submodule_search_locations:
+            _cuda_path = _spec.submodule_search_locations[0]
+    except Exception:
+        pass
+    if _cuda_path is None:
+        try:
+            from pathlib import Path as _Path
+            import torch as _torch
+            _cu_ver = _torch.version.cuda  # e.g. "12.6"
+            if _cu_ver:
+                for _d in sorted(
+                    _Path("/hpc/apps/x86_64/cuda").glob(f"{_cu_ver}*"),
+                    reverse=True,
+                ):
+                    if (_d / "bin" / "nvcc").exists():
+                        _cuda_path = str(_d)
+                        break
+        except Exception:
+            pass
+    if _cuda_path:
+        _os.environ["CUDA_PATH"] = _cuda_path
 
 # Try to use CuPy for GPU-accelerated registration
 try:
@@ -245,6 +288,180 @@ def register_translation_gpu(image_a, image_b, upsample_factor=10):
         return model.shift_vector, model.confidence
 
 
+import threading as _threading
+
+_gpu_thread_state = _threading.local()
+
+
+def _gpu_stream():
+    """Per-thread CUDA stream. With 16 threads all calling GPU phase-corr, the
+    default stream serializes their kernels; giving each thread its own
+    non-blocking stream lets kernels from different threads overlap on the GPU.
+    Returns ``None`` on CPU.
+    """
+    if not _USING_CUPY:
+        return None
+    s = getattr(_gpu_thread_state, "stream", None)
+    if s is None:
+        s = xp.cuda.Stream(non_blocking=True)
+        _gpu_thread_state.stream = s
+    return s
+
+
+def _dexp_cupy_backend():
+    """Per-thread ``CupyBackend`` for pushing dexp onto GPU. Cached because
+    construction touches cub/cutensor toggles + cudnn probe — one-off cost.
+    Disable dexp's own memory pool (share cupy's global pool across threads)
+    and its per-call clearing (would kill throughput).
+    """
+    if not _USING_CUPY:
+        return None
+    b = getattr(_gpu_thread_state, "dexp_backend", None)
+    if b is None:
+        from dexp.utils.backends import CupyBackend
+        b = CupyBackend(enable_memory_pool=False, enable_memory_pool_clearing=False)
+        _gpu_thread_state.dexp_backend = b
+    return b
+
+
+class _SimpleTranslationModel:
+    """Duck-typed replacement for dexp's ``TranslationRegistrationModel`` —
+    exposes ``.shift_vector`` (numpy) and ``.confidence`` (float). Returned
+    by ``batched_phase_correlation`` so callers can treat batched results
+    exactly like per-call ``offset()`` returns.
+    """
+    __slots__ = ("shift_vector", "confidence")
+
+    def __init__(self, shift_vector, confidence):
+        self.shift_vector = shift_vector
+        self.confidence = float(confidence)
+
+
+def _preprocess_batch_gpu(images):
+    """Batched dexp-style preprocessing on GPU.
+
+    Applies gaussian denoise + log1p + sobel magnitude + Hanning window to
+    each (H, W) plane of an (N, H, W) tensor in one kernel launch per stage
+    (5 kernels total, vs ~10 per single call from dexp).
+    """
+    from cupyx.scipy.ndimage import gaussian_filter, sobel
+    # Denoise on spatial axes only; sigma=0 on batch axis skips it.
+    images = gaussian_filter(images, sigma=(0, 1.5, 1.5))
+    images = xp.log1p(images)
+    # Sobel edge magnitude (matches dexp's edge_filter=True default).
+    sy = sobel(images, axis=-2)
+    sx = sobel(images, axis=-1)
+    images = xp.sqrt(sy * sy + sx * sx)
+    # Hanning^0.5 window (dexp's `window=0.5` default is a sqrt of Hanning).
+    N, H, W = images.shape
+    win_y = xp.sqrt(xp.hanning(H)).astype(xp.float32)
+    win_x = xp.sqrt(xp.hanning(W)).astype(xp.float32)
+    win = win_y[:, None] * win_x[None, :]  # (H, W)
+    return images * win[None, :, :]
+
+
+def batched_phase_correlation(
+    rois_a, rois_b, pitch_yx=(0, 0), preprocess=True, chunk_size=128,
+) -> list:
+    """Batched phase correlation on GPU with dexp-style preprocessing.
+
+    Parameters
+    ----------
+    rois_a, rois_b : (N, H, W) arrays (numpy or cupy). Must have the same shape.
+        These are the pre-extracted overlap ROIs — the caller does the axis-
+        selection that ``offset()`` does inline.
+    pitch_yx : (corr_y, corr_x) integer offsets added to every returned shift
+        (matches ``offset()``'s ``model.shift_vector += (corr_y, corr_x)`` step
+        that converts the ROI-space shift into the tile-pitch shift).
+    preprocess : if True, run gaussian + log1p + sobel + Hanning on each ROI
+        (matches dexp's default pipeline). Set False for a "bare" phase corr.
+
+    Returns
+    -------
+    list of ``_SimpleTranslationModel`` of length N, in input order. On
+    ``_USING_CUPY=False``, falls back to per-item ``dexp_reg.register_translation_nd``.
+    """
+    rois_a = np.asarray(rois_a) if not _USING_CUPY else rois_a
+    rois_b = np.asarray(rois_b) if not _USING_CUPY else rois_b
+    if rois_a.shape != rois_b.shape:
+        raise ValueError(f"rois_a shape {rois_a.shape} != rois_b shape {rois_b.shape}")
+    N = rois_a.shape[0]
+    corr_y, corr_x = int(pitch_yx[0]), int(pitch_yx[1])
+    # Chunk large batches: peak GPU memory during preprocess+FFT is ~40 MB per
+    # (300 × 2660) edge (or ~15 MB per (948 × 650) edge). 839-edge batches
+    # blow past 30 GB of intermediates and fragment cupy's pool; smaller
+    # chunks fit comfortably and per-launch overhead is still amortized.
+    if _USING_CUPY and chunk_size is not None and N > chunk_size:
+        models = []
+        for i in range(0, N, chunk_size):
+            models.extend(batched_phase_correlation(
+                rois_a[i:i + chunk_size], rois_b[i:i + chunk_size],
+                pitch_yx=pitch_yx, preprocess=preprocess, chunk_size=None,
+            ))
+        return models
+
+    if not _USING_CUPY:
+        # CPU fallback — per-item dexp. Slower but at least this function is
+        # callable on CPU nodes for debugging.
+        models = []
+        for i in range(N):
+            m = dexp_reg.register_translation_nd(
+                rois_a[i].astype(np.float32), rois_b[i].astype(np.float32),
+            )
+            sv = np.asarray(m.shift_vector, dtype=np.float64)
+            sv += np.array([corr_y, corr_x])
+            models.append(_SimpleTranslationModel(sv, float(m.confidence)))
+        return models
+
+    # GPU path. One stream per thread lets multiple batched calls from different
+    # threads overlap on the GPU.
+    stream = _gpu_stream()
+    with stream:
+        a = xp.asarray(rois_a, dtype=xp.float32)
+        b = xp.asarray(rois_b, dtype=xp.float32)
+        if preprocess:
+            a = _preprocess_batch_gpu(a)
+            b = _preprocess_batch_gpu(b)
+        # Batched FFT2 — cufft fans out across the batch dim.
+        Fa = xp.fft.fft2(a)
+        Fb = xp.fft.fft2(b)
+        cross = Fa * xp.conj(Fb)
+        cross = cross / (xp.abs(cross) + 1e-10)
+        corr = xp.fft.ifft2(cross).real  # (N, H, W)
+        H, W = corr.shape[-2], corr.shape[-1]
+        # Peak per batch item via a flat argmax on axis=(-2, -1).
+        flat = corr.reshape(N, H * W)
+        peak_flat = xp.argmax(flat, axis=1)  # (N,)
+        peak_val = xp.take_along_axis(flat, peak_flat[:, None], axis=1).squeeze(1)
+        raw_py = peak_flat // W
+        raw_px = peak_flat % W
+        # Peak-to-background confidence: zero out a small window around each
+        # peak, take max of remainder, confidence = (peak - bg) / (peak + eps).
+        m_h = max(8, int(H ** 0.9) // 8)
+        m_w = max(8, int(W ** 0.9) // 8)
+        y_grid = xp.arange(H, dtype=xp.int32)[None, :, None]  # (1, H, 1)
+        x_grid = xp.arange(W, dtype=xp.int32)[None, None, :]  # (1, 1, W)
+        py = raw_py[:, None, None].astype(xp.int32)
+        px = raw_px[:, None, None].astype(xp.int32)
+        mask = (xp.abs(y_grid - py) < m_h) & (xp.abs(x_grid - px) < m_w)
+        masked = xp.where(mask, xp.float32(0.0), corr)
+        bg = masked.reshape(N, H * W).max(axis=1)
+        conf = (peak_val - bg) / (peak_val + 1e-6)
+        # Wrap peak coordinates from [0, N) to signed [-N/2, N/2).
+        shift_y = xp.where(raw_py > H // 2, raw_py - H, raw_py).astype(xp.float64)
+        shift_x = xp.where(raw_px > W // 2, raw_px - W, raw_px).astype(xp.float64)
+        # One D2H sync — bring N shifts + N confidences back to CPU.
+        shift_y_np = xp.asnumpy(shift_y)
+        shift_x_np = xp.asnumpy(shift_x)
+        conf_np = xp.asnumpy(conf)
+
+    models = []
+    for i in range(N):
+        sv = np.array([shift_y_np[i] + corr_y, shift_x_np[i] + corr_x], dtype=np.float64)
+        models.append(_SimpleTranslationModel(sv, float(conf_np[i])))
+    return models
+
+
 def offset(
     image_a: np.array, image_b: np.array, relation: tuple, overlap
 ) -> "TranslationRegistrationModel":
@@ -282,15 +499,29 @@ def offset(
     if roi_b_min < 0:
         roi_b = roi_b - roi_b_min
 
-    # Always use dexp for registration (accurate subpixel shifts + confidence).
-    # The ROIs are small (overlap-sized crops) so CPU is fast enough.
-    # GPU register_translation_gpu has inaccurate confidence scores and no subpixel refinement.
     if _USING_CUPY:
-        roi_a = xp.asnumpy(roi_a)
-        roi_b = xp.asnumpy(roi_b)
-    model = dexp_reg.register_translation_nd(roi_a, roi_b)
+        # Run dexp's full pipeline (denoise + log + sobel + Hanning window +
+        # phase correlation + peak-to-background confidence) on GPU by
+        # pushing a CupyBackend onto dexp's thread-local backend stack.
+        # ``force_numpy=True`` brings shift_vector/confidence back to numpy
+        # inside the CupyBackend context (dexp's default is False, which
+        # would leave them as cupy arrays and break the ``+= np.array(...)``
+        # below with "Implicit conversion to a NumPy array is not allowed").
+        # Per-thread stream lets 16 concurrent calls overlap kernels.
+        with _dexp_cupy_backend(), _gpu_stream():
+            # ``internal_dtype=np.float32`` — dexp's CPU path forces float32
+            # via a ``type(Backend.current()) is NumpyBackend`` check that
+            # doesn't fire on CupyBackend; without the explicit override, an
+            # uint16 input would keep uint16 as internal dtype and dexp's
+            # in-place ``image *= hanning`` window multiply hits numpy's
+            # same_kind cast rule and raises.
+            model = dexp_reg.register_translation_nd(
+                roi_a, roi_b, force_numpy=True, internal_dtype=np.float32,
+            )
+    else:
+        model = dexp_reg.register_translation_nd(roi_a, roi_b)
+    model.shift_vector = np.asarray(model.shift_vector, dtype=np.float64)
     model.shift_vector += np.array([corr_y, corr_x])
-
     return model
 
 
