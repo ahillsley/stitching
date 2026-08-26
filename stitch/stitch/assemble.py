@@ -999,6 +999,159 @@ def _d2h_and_submit_writes(norm_gpu, transfer_stream, arr_out, final_shape,
     del norm_cpu
 
 
+_WRITE_STATS = {
+    "n": 0, "total_s": 0.0, "total_bytes": 0,
+    "inflight": 0, "max_inflight": 0,
+    "lock": None,
+}
+
+# Shard batching state (set per assemble_streaming call when the output array
+# is sharded). Bypasses the per-block zarr write path in favour of copying
+# blocks into a large in-memory buffer that covers the worker's entire Y
+# range (=one shard row for shard-aligned partitions); the buffer is flushed
+# as ONE ``arr_out[slice]=buf`` per X-shard column at the end of the Y range.
+# Cuts zarr shard read-modify-write amplification from ~1500 per Y range to
+# ~12 (one per X shard).
+_SHARD_BATCH = {"buf": None, "y0": None, "y1": None, "enabled": False}
+
+
+def _buffer_block(y0, y1, x0, x1, block_cpu):
+    """Shard-batch path: copy the block into the in-memory Y-range buffer
+    rather than writing it to zarr. Called instead of _write_zarr_block when
+    _SHARD_BATCH["enabled"] is True.
+    """
+    buf = _SHARD_BATCH["buf"]
+    y_off = y0 - _SHARD_BATCH["y0"]
+    # Buffer shape is (T=1, C, Z=1, shard_h, total_x); block shape is
+    # (T=1, C, Z=1, y1-y0, x1-x0). Assign into the corresponding slice.
+    buf[:, :, :, y_off:y_off + (y1 - y0), x0:x1] = block_cpu
+    return int(block_cpu.nbytes), 0.0
+
+
+_EMPTY_U64 = (1 << 64) - 1  # zarr sharding_indexed sentinel for absent chunks
+
+
+def _encode_chunks_to_bytes(chunks_view, zstd_codec, fill_value, encode_pool=None):
+    """Encode all chunks in ``chunks_view`` (shape (n_cy, n_cx, chunk_h, chunk_w))
+    to zstd-encoded bytes. Empty chunks (all == fill_value) return None.
+
+    ``encode_pool``: optional shared ThreadPoolExecutor to reuse across many
+    shards; when None, a private pool is created.
+    """
+    import numpy as _np
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    n_cy, n_cx = chunks_view.shape[:2]
+    n_chunks = n_cy * n_cx
+    encoded = [None] * n_chunks
+
+    def _one(idx):
+        i, j = divmod(idx, n_cx)
+        chunk = chunks_view[i, j]
+        if (chunk == fill_value).all():
+            return idx, None
+        raw = _np.ascontiguousarray(chunk).tobytes()
+        return idx, zstd_codec.encode(raw)
+
+    if encode_pool is None:
+        with _TPE(max_workers=32) as pool:
+            for idx, enc in pool.map(_one, range(n_chunks)):
+                encoded[idx] = enc
+    else:
+        for idx, enc in encode_pool.map(_one, range(n_chunks)):
+            encoded[idx] = enc
+    return encoded
+
+
+def _assemble_and_write_shard(shard_path, encoded_chunks):
+    """Given a list of encoded chunk bytes (or None for empty), assemble a
+    zarr v3 sharding_indexed shard file body and write it to disk. Cheap:
+    no compute, just concatenation + a single ``write()``.
+    """
+    import numpy as _np
+    import os as _os
+    from google_crc32c import Checksum as _CRC
+
+    n_chunks = len(encoded_chunks)
+    parts = []
+    offsets = [_EMPTY_U64] * n_chunks
+    lengths = [_EMPTY_U64] * n_chunks
+    cursor = 0
+    for idx, enc in enumerate(encoded_chunks):
+        if enc is None:
+            continue
+        offsets[idx] = cursor
+        lengths[idx] = len(enc)
+        parts.append(enc)
+        cursor += len(enc)
+
+    idx_arr = _np.empty(2 * n_chunks, dtype='<u8')
+    idx_arr[0::2] = offsets
+    idx_arr[1::2] = lengths
+    idx_bytes = idx_arr.tobytes()
+
+    crc = _CRC()
+    crc.update(idx_bytes)
+    crc_bytes_le = crc.digest()[::-1]  # google_crc32c is big-endian; zarr writes LE
+
+    shard_bytes = b"".join(parts) + idx_bytes + crc_bytes_le
+
+    _os.makedirs(_os.path.dirname(shard_path), exist_ok=True)
+    with open(shard_path, "wb") as fh:
+        fh.write(shard_bytes)
+
+    n_empty = sum(1 for e in encoded_chunks if e is None)
+    return len(shard_bytes), n_chunks - n_empty, n_empty
+
+
+def _encode_shard_direct(
+    shard_path,
+    shard_data,
+    chunk_shape,
+    zstd_codec,
+    fill_value=0,
+    encode_pool=None,
+    stats_out=None,
+):
+    """Encode one zarr v3 sharding_indexed shard file directly.
+
+    Bypasses zarr's synchronous shard writer to encode chunks in parallel
+    with numcodecs and assemble the shard file (chunk bytes || tail index
+    || CRC32C) ourselves. Empty chunks (all == fill_value) store the
+    (2^64-1, 2^64-1) sentinel — cheap AND smaller shard files on sparse
+    tissue (A/1 is ~91% background).
+
+    Assumes zarr v3 sharding_indexed with:
+      * codec chain = `[bytes(little-endian), zstd(level=?)]`
+      * index_codecs = `[bytes(little-endian), crc32c]`, index_location=end
+    """
+    T, C, Z, sh_h, sh_w = shard_data.shape
+    chunk_h, chunk_w = chunk_shape[-2], chunk_shape[-1]
+    assert sh_h % chunk_h == 0 and sh_w % chunk_w == 0, (
+        f"shard shape {shard_data.shape[-2:]} not chunk-aligned {(chunk_h, chunk_w)}"
+    )
+    n_cy = sh_h // chunk_h
+    n_cx = sh_w // chunk_w
+
+    chunks_view = (
+        shard_data[0, 0, 0]
+        .reshape(n_cy, chunk_h, n_cx, chunk_w)
+        .transpose(0, 2, 1, 3)
+    )
+
+    t0 = time.time()
+    encoded = _encode_chunks_to_bytes(chunks_view, zstd_codec, fill_value, encode_pool)
+    t_encode = time.time() - t0
+
+    t1 = time.time()
+    nbytes, n_enc, n_empty = _assemble_and_write_shard(shard_path, encoded)
+    t_write = time.time() - t1
+
+    if stats_out is not None:
+        stats_out.append((t_encode, t_write, n_enc, n_empty, nbytes))
+    return shard_path, n_enc, n_empty, nbytes
+
+
 def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu, t_out=0):
     """Write a single normalized block to the output zarr array (via zarr API).
 
@@ -1007,6 +1160,14 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu, t_out=0):
     canvas is (N, C, Z, Y, X) and each timepoint writes its own T slice; default
     0 = the single-T behavior). Returns (data_bytes, elapsed) for profiling.
     """
+    import threading as _th
+    if _WRITE_STATS["lock"] is None:
+        _WRITE_STATS["lock"] = _th.Lock()
+    lock = _WRITE_STATS["lock"]
+    with lock:
+        _WRITE_STATS["inflight"] += 1
+        if _WRITE_STATS["inflight"] > _WRITE_STATS["max_inflight"]:
+            _WRITE_STATS["max_inflight"] = _WRITE_STATS["inflight"]
     t0 = time.time()
     data_bytes = norm_cpu.nbytes
     arr_out[
@@ -1018,13 +1179,34 @@ def _write_zarr_block(arr_out, final_shape, y0, y1, x0, x1, norm_cpu, t_out=0):
             slice(x0, x1),
         )
     ] = norm_cpu
-    return data_bytes, time.time() - t0
+    elapsed = time.time() - t0
+    with lock:
+        _WRITE_STATS["inflight"] -= 1
+        _WRITE_STATS["n"] += 1
+        _WRITE_STATS["total_s"] += elapsed
+        _WRITE_STATS["total_bytes"] += data_bytes
+    return data_bytes, elapsed
 
 
 def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
                           blosc_codec, y0, x0, _write_executor, _write_futures,
-                          t_out=0):
+                          t_out=0, arr_out=None, final_shape=None):
     """Per-X-block D2H + direct-chunk-write. Companion to `_process_y_band_gpu_xblock`.
+
+    Two write backends:
+
+    * ``chunk_root != None`` (direct-file): writes each channel's chunk as its
+      own file at ``c/{t}/{c}/0/{y_idx}/{x_idx}``. Fast on unsharded arrays
+      (5-8x zarr's sync API by dodging its shared asyncio event loop) but
+      incompatible with sharding_indexed (chunks live inside shard files with
+      an index, not at per-chunk paths).
+
+    * ``chunk_root is None`` and ``arr_out is not None`` (zarr-API): falls
+      back to ``arr_out[slice] = block_cpu``. Slow when many workers contend
+      on one array via the sync writer's shared event loop; FINE when each
+      worker owns exclusive shards (concurrent-write test: 16.9 GB/s
+      aggregate across 4 processes on distinct shard files). Path taken for
+      sharded arrays where the per-chunk-file layout doesn't exist.
 
     Runs in the D2H worker thread. Allocates a pinned numpy buffer sized
     exactly to ``norm_gpu_x.shape`` (guaranteed contiguous), D2Hs into it,
@@ -1055,10 +1237,27 @@ def _d2h_and_write_xblock(norm_gpu_x, transfer_stream, chunk_root, chunk_hw,
     # frees the pool slot for the next D2H's reuse.
     block_cpu = pinned_buf.copy()
     del pinned_buf
-    fut = _write_executor.submit(
-        _write_zarr_block_direct, chunk_root, chunk_hw, blosc_codec,
-        y0, x0, block_cpu, t_out,
-    )
+    if chunk_root is not None:
+        fut = _write_executor.submit(
+            _write_zarr_block_direct, chunk_root, chunk_hw, blosc_codec,
+            y0, x0, block_cpu, t_out,
+        )
+    elif _SHARD_BATCH.get("enabled"):
+        # Shard-batch path: memcpy into the Y-range buffer instead of hitting
+        # zarr. Deferred flush happens once per X-shard at end of Y range.
+        y1 = y0 + block_cpu.shape[3]
+        x1 = x0 + block_cpu.shape[4]
+        fut = _write_executor.submit(
+            _buffer_block, y0, y1, x0, x1, block_cpu,
+        )
+    else:
+        # zarr-API path (sharded arrays). block_cpu shape = (1, C, 1, blk_h, blk_w).
+        y1 = y0 + block_cpu.shape[3]
+        x1 = x0 + block_cpu.shape[4]
+        fut = _write_executor.submit(
+            _write_zarr_block, arr_out, final_shape,
+            y0, y1, x0, x1, block_cpu, t_out,
+        )
     _write_futures.append(fut)
 
 
@@ -1521,8 +1720,47 @@ def assemble_streaming(
     # Background writer: submit zarr writes to a thread pool so GPU can
     # continue with the next Y-band while chunks are flushed to disk.
     # 32-way matches what the LiveScreen convert step used to hit ~4 GB/s NFS.
-    _write_executor = ThreadPoolExecutor(max_workers=32)
+    # ``OPS_WRITE_WORKERS`` overrides the default (used for sweeping the
+    # sharded-output write path where read-modify-write on shard files may
+    # or may not benefit from more concurrency).
+    _write_max_workers = int(os.environ.get("OPS_WRITE_WORKERS", "32"))
+    _write_executor = ThreadPoolExecutor(max_workers=_write_max_workers)
     _write_futures = []
+    print(f"[assemble.streaming] write executor threads = {_write_max_workers}")
+
+    _is_sharded = getattr(arr_out, "shards", None) is not None
+
+    # Shard batching: when the output is sharded AND the caller's y_range is
+    # shard-aligned (bands_per_range * chunk_h == shard_h × k), allocate a
+    # buffer covering the whole Y range and defer zarr writes to end-of-range.
+    # OPS_SHARD_BATCH=0 disables (fall back to per-block zarr writes).
+    _shard_batch_on = (
+        _is_sharded
+        and y_range is not None
+        and os.environ.get("OPS_SHARD_BATCH", "1") not in ("0", "false", "False")
+    )
+    if _shard_batch_on:
+        _shard_h = int(arr_out.shards[-2])
+        y_lo_r, y_hi_r = int(y_range[0]), int(y_range[1])
+        y_span = y_hi_r - y_lo_r
+        # Partial-height Y ranges (last worker on canvases whose Y is not a
+        # multiple of shard_h) are STILL shard-batchable — the buffer is
+        # sized to y_span, flush writes ``arr_out[y_lo:y_hi] = buf`` and
+        # zarr handles the partial shard row internally (single RMW per
+        # X-shard column, still race-free since each worker owns unique
+        # Y-shard rows). Only skip batching if y_range is missing.
+    if _shard_batch_on:
+        _out_dtype = np.dtype(arr_out.dtype)
+        _buf_shape = (final_shape[0], final_shape[1], final_shape[2],
+                      y_span, total_x)
+        _buf_bytes = int(np.prod(_buf_shape)) * _out_dtype.itemsize
+        _SHARD_BATCH["buf"] = np.zeros(_buf_shape, dtype=_out_dtype)
+        _SHARD_BATCH["y0"] = y_lo_r
+        _SHARD_BATCH["y1"] = y_hi_r
+        _SHARD_BATCH["enabled"] = True
+        print(f"[assemble.streaming] shard_batch ON  buf={_buf_shape} "
+              f"({_buf_bytes/1e9:.1f} GB) y_range=({y_lo_r},{y_hi_r})  "
+              f"defer writes to end-of-range flush")
 
     # D2H pipelining: single worker (norm_gpu is 19 GB per band and two of them
     # + a band's 38 GB numer/denom is right at H100 80 GB — no room for more
@@ -1557,6 +1795,15 @@ def assemble_streaming(
     # scaled to ~2.8 GB/s at 16 workers on our probe. Only valid when
     # divide_tile_size matches the array's chunk shape (writes are then
     # exactly 1 chunk each — no partial-chunk read-modify-write).
+    # Sharded output — the per-chunk-file paths that direct-write writes to
+    # don't exist under sharding_indexed (chunks live inside shard files with
+    # a tail-index). Fall back to zarr's sync API; each worker owns exclusive
+    # shards, so no event-loop contention. ``_is_sharded`` is set earlier.
+    if _is_sharded and use_direct_writes:
+        print(f"[assemble.streaming] direct writes disabled: sharded output "
+              f"detected (shards={arr_out.shards}) — using zarr sync API")
+        use_direct_writes = False
+
     _direct_write_config = None
     if use_direct_writes:
         import numcodecs
@@ -1651,11 +1898,19 @@ def assemble_streaming(
         if _USING_CUPY and xblock_scoped_gpu:
             # X-block-scoped path: allocate tiny per-X-block numer/denom (~34 MB
             # each), yield (x0, x1, norm_gpu_x) per X-block, submit per-X-block
-            # D2H+direct-write. Peak GPU memory drops ~500× vs the full-band
-            # path — enables running multiple bands per GPU (Phase 2) and multi
-            # GPU (Phase 3). Requires direct writes (chunk-aligned x blocks).
-            assert _direct_write_config is not None, (
-                "xblock_scoped_gpu requires use_direct_writes=True"
+            # D2H+write. Peak GPU memory drops ~500× vs the full-band path —
+            # enables running multiple bands per GPU (Phase 2) and multi GPU
+            # (Phase 3). Two write backends supported:
+            #   * direct-file writes (unsharded arrays): chunk-file-per-XBlock
+            #   * zarr-API writes (sharded arrays): arr_out[slice] = data.
+            #     The per-chunk-file paths don't exist under sharding_indexed;
+            #     zarr's sync writer packs chunks into shard files internally.
+            #     Concurrent-write test on distinct shards: 16.9 GB/s aggregate
+            #     across 4 processes — no event-loop contention since each
+            #     worker owns exclusive shards.
+            assert _direct_write_config is not None or _is_sharded, (
+                "xblock_scoped_gpu requires use_direct_writes=True OR a "
+                "sharded output array"
             )
 
             def _run_one_band_xblock(y0_b, y1_b, band_tiles, tile_cache_b,
@@ -1680,15 +1935,25 @@ def assemble_streaming(
                         while len(_write_futures) > _MAX_WRITE_FUTURES:
                             _write_futures[0].result()
                             _write_futures.pop(0)
-                        fut = _d2h_executor.submit(
-                            _d2h_and_write_xblock, norm_gpu_x, _transfer_stream,
-                            _direct_write_config["chunk_root"],
-                            _direct_write_config["chunk_hw"],
-                            _direct_write_config["blosc_codec"],
-                            y0_b, x0_x,
-                            _write_executor, _write_futures,
-                            t_out,
-                        )
+                        if _direct_write_config is not None:
+                            fut = _d2h_executor.submit(
+                                _d2h_and_write_xblock, norm_gpu_x, _transfer_stream,
+                                _direct_write_config["chunk_root"],
+                                _direct_write_config["chunk_hw"],
+                                _direct_write_config["blosc_codec"],
+                                y0_b, x0_x,
+                                _write_executor, _write_futures,
+                                t_out,
+                            )
+                        else:
+                            # Sharded path — arr_out.__setitem__ handles the shard packing.
+                            fut = _d2h_executor.submit(
+                                _d2h_and_write_xblock, norm_gpu_x, _transfer_stream,
+                                None, None, None,
+                                y0_b, x0_x,
+                                _write_executor, _write_futures,
+                                t_out, arr_out, final_shape,
+                            )
                         d2h_futs.append(fut)
                     for f in d2h_futs:
                         f.result()
@@ -1915,9 +2180,218 @@ def assemble_streaming(
             n_failed += 1
             print(f"  WARNING: background zarr write failed: {e}")
     _write_executor.shutdown(wait=True)
+
+    # Shard-batch flush: buffered writes have all landed. Direct-shard-encode
+    # each (channel, X-shard) — bypasses zarr's serial sharding writer by
+    # doing parallel zstd encode + manual shard-bytes assembly + one
+    # ``open("wb").write(...)`` per shard file. Empty chunks (all == fill)
+    # skip encoding and store the sentinel — big win on sparse tissue.
+    # OPS_SHARD_DIRECT_ENCODE=0 falls back to the arr_out[slice]=data path.
+    if _SHARD_BATCH.get("enabled"):
+        t_flush = time.time()
+        _sh_h = int(arr_out.shards[-2])
+        _sh_w = int(arr_out.shards[-1])
+        _y_lo = _SHARD_BATCH["y0"]
+        _y_hi = _SHARD_BATCH["y1"]
+        _buf = _SHARD_BATCH["buf"]
+        _n_c = int(final_shape[1])
+        _fill = int(getattr(arr_out, "fill_value", 0) or 0)
+
+        # Detect codec config: read the inner compression codec from
+        # zarr.json. We support raw ``zstd`` and ``blosc`` (which internally
+        # uses SIMD + threading, ~2-3x faster on integer data with bitshuffle).
+        _use_direct_encode = os.environ.get("OPS_SHARD_DIRECT_ENCODE", "1") not in ("0", "false", "False")
+        _inner_codec_kind = None  # "zstd" or "blosc"
+        _codec_instance = None
+        if _use_direct_encode:
+            try:
+                from pathlib import Path as _P
+                _store = getattr(arr_out, "store", None)
+                if _store is None and hasattr(arr_out, "native"):
+                    _store = arr_out.native.store
+                _arr_root = _P(_store.root) / arr_out.path.strip("/")
+                _meta = json.loads((_arr_root / "zarr.json").read_text())
+                _sharding_cfg = next(
+                    (c["configuration"] for c in _meta["codecs"]
+                     if c.get("name") == "sharding_indexed"), None,
+                )
+                if _sharding_cfg is None:
+                    raise RuntimeError("no sharding_indexed codec in zarr.json")
+                _inner_chunk = tuple(_sharding_cfg["chunk_shape"])
+                _blosc_cfg = next(
+                    (c["configuration"] for c in _sharding_cfg["codecs"]
+                     if c.get("name") == "blosc"), None,
+                )
+                _zstd_cfg = next(
+                    (c["configuration"] for c in _sharding_cfg["codecs"]
+                     if c.get("name") == "zstd"), None,
+                )
+                if _blosc_cfg is not None:
+                    import numcodecs
+                    from numcodecs import blosc as _blosc_mod
+                    # numcodecs.Blosc's default nthreads == os.cpu_count().
+                    # Calling encode from N=32 outer ThreadPool workers with
+                    # each blosc call spawning 48 inner threads over-subscribes
+                    # (~1500 threads on 48 cores). Force blosc to single-thread
+                    # so our outer pool controls parallelism.
+                    _blosc_mod.set_nthreads(1)
+                    _shuffle_map = {"noshuffle": 0, "shuffle": 1, "bitshuffle": 2}
+                    _codec_instance = numcodecs.Blosc(
+                        cname=_blosc_cfg["cname"],
+                        clevel=int(_blosc_cfg.get("clevel", 3)),
+                        shuffle=_shuffle_map[_blosc_cfg["shuffle"]],
+                    )
+                    _inner_codec_kind = "blosc"
+                    print(f"[assemble.streaming] direct shard encode ON  "
+                          f"inner_chunk={_inner_chunk} codec=blosc("
+                          f"{_blosc_cfg['cname']},cl={_blosc_cfg.get('clevel')},"
+                          f"{_blosc_cfg['shuffle']})  fill={_fill}")
+                elif _zstd_cfg is not None:
+                    from numcodecs.zstd import Zstd
+                    _codec_instance = Zstd(level=int(_zstd_cfg.get("level", 0)))
+                    _inner_codec_kind = "zstd"
+                    print(f"[assemble.streaming] direct shard encode ON  "
+                          f"inner_chunk={_inner_chunk} codec=zstd(level={_zstd_cfg.get('level',0)})  fill={_fill}")
+                else:
+                    raise RuntimeError(
+                        "direct encode requires blosc or zstd inner codec; got "
+                        f"{[c.get('name') for c in _sharding_cfg['codecs']]}"
+                    )
+            except Exception as _e:
+                print(f"[assemble.streaming] direct shard encode DISABLED "
+                      f"({type(_e).__name__}: {_e}); falling back to zarr sync writer")
+                _use_direct_encode = False
+
+        x_shard_edges = list(range(0, total_x, _sh_w))
+
+        if _use_direct_encode:
+            _codec = _codec_instance
+            from pathlib import Path as _P
+            _store = getattr(arr_out, "store", None)
+            if _store is None and hasattr(arr_out, "native"):
+                _store = arr_out.native.store
+            _arr_root = _P(_store.root) / arr_out.path.strip("/")
+            _y_sh_idx = _y_lo // _sh_h
+
+            # Flat two-stage pipeline: (1) SINGLE encode pool encodes all
+            # chunks across all N_shards*N_chunks_per_shard tasks in
+            # parallel — no nested pools to oversubscribe the CPU. (2) After
+            # encode: assemble + write shard files (cheap; can run in a
+            # small write pool for NFS I/O parallelism).
+            _enc_threads = int(os.environ.get("OPS_ENCODE_WORKERS", "32"))
+            _wri_threads = int(os.environ.get("OPS_FLUSH_WORKERS", "16"))
+            _chunk_h = _inner_chunk[-2]
+            _chunk_w = _inner_chunk[-1]
+
+            # Pre-extract shard data views (fast, no copy for full shards).
+            _shards = []  # list of (shard_path, chunks_view)
+            for c in range(_n_c):
+                for xi, x0 in enumerate(x_shard_edges):
+                    x1 = min(total_x, x0 + _sh_w)
+                    slab_h = _y_hi - _y_lo
+                    slab_w = x1 - x0
+                    if slab_h == _sh_h and slab_w == _sh_w:
+                        sd = _buf[:, c:c+1, :, :, x0:x1]
+                    else:
+                        sd = np.zeros((1, 1, 1, _sh_h, _sh_w), dtype=_buf.dtype)
+                        sd[:, :, :, :slab_h, :slab_w] = _buf[:, c:c+1, :, :, x0:x1]
+                    n_cy = _sh_h // _chunk_h
+                    n_cx = _sh_w // _chunk_w
+                    cview = (sd[0, 0, 0]
+                             .reshape(n_cy, _chunk_h, n_cx, _chunk_w)
+                             .transpose(0, 2, 1, 3))
+                    sp = str(_arr_root / "c" / str(t_out) / str(c) / "0"
+                             / str(_y_sh_idx) / str(xi))
+                    _shards.append((sp, cview))
+
+            _n_shards = len(_shards)
+
+            # Encode → write pipeline: as each shard's encode completes, hand
+            # its bytes to the write pool immediately. Wall ~= max(encode, write)
+            # instead of sum. Encode dominates on dense shards, write dominates
+            # on sparse (mostly-empty) ones.
+            def _encode_task(pair):
+                sh_idx, (sp, cview) = pair
+                n_cy, n_cx = cview.shape[:2]
+                encoded = [None] * (n_cy * n_cx)
+                for chunk_idx in range(n_cy * n_cx):
+                    i, j = divmod(chunk_idx, n_cx)
+                    ch = cview[i, j]
+                    if (ch == _fill).all():
+                        continue
+                    encoded[chunk_idx] = _codec.encode(np.ascontiguousarray(ch).tobytes())
+                return sh_idx, sp, encoded
+
+            _enc_pool = ThreadPoolExecutor(max_workers=min(_n_shards, _enc_threads))
+            _wri_pool = ThreadPoolExecutor(max_workers=min(_n_shards, _wri_threads))
+            try:
+                _wri_futures = []
+                # Submit encodes and, as each finishes (in completion order),
+                # forward its bytes to the write pool.
+                from concurrent.futures import as_completed as _as_completed
+                _enc_futures = [_enc_pool.submit(_encode_task, (i, s))
+                                for i, s in enumerate(_shards)]
+                _t_encode_last = t_flush
+                for _fut in _as_completed(_enc_futures):
+                    _sh_idx, _sp, _encoded = _fut.result()
+                    _t_encode_last = time.time()
+                    _wri_futures.append(_wri_pool.submit(
+                        _assemble_and_write_shard, _sp, _encoded
+                    ))
+                _t_encode = _t_encode_last - t_flush
+                # Drain writes
+                _wri_results = [f.result() for f in _wri_futures]
+                _t_write_end = time.time()
+            finally:
+                _enc_pool.shutdown(wait=True)
+                _wri_pool.shutdown(wait=True)
+
+            _flush_wall = _t_write_end - t_flush
+            _flush_bytes = sum(r[0] for r in _wri_results)
+            _n_enc_total = sum(r[1] for r in _wri_results)
+            _n_empty_total = sum(r[2] for r in _wri_results)
+            print(f"  [Shard flush direct] {_n_shards} shard-files "
+                  f"({len(x_shard_edges)} X-shards x {_n_c} C)  "
+                  f"total={_flush_wall:.2f}s encode_last_ready={_t_encode:.2f}s  "
+                  f"encoded_chunks={_n_enc_total} empty_chunks={_n_empty_total}  "
+                  f"on-disk={_flush_bytes/1e9:.2f} GB "
+                  f"enc_pool={_enc_threads} wri_pool={_wri_threads}")
+        else:
+            # Fallback: zarr sync writer, one setitem per (C, X-shard).
+            _flush_tasks = [(c, x0) for c in range(_n_c) for x0 in x_shard_edges]
+            def _flush_one(_task):
+                _c, _x0 = _task
+                _x1 = min(total_x, _x0 + _sh_w)
+                _t = time.time()
+                arr_out[
+                    slice(t_out, t_out + 1), slice(_c, _c + 1),
+                    slice(0, final_shape[2]), slice(_y_lo, _y_hi), slice(_x0, _x1),
+                ] = _buf[:, _c:_c + 1, :, :, _x0:_x1]
+                return int(_buf[:, _c:_c + 1, :, :, _x0:_x1].nbytes), time.time() - _t
+            _flush_pool_size = int(os.environ.get("OPS_FLUSH_WORKERS", "32"))
+            with ThreadPoolExecutor(max_workers=min(len(_flush_tasks), _flush_pool_size)) as _flush_pool:
+                _flush_results = list(_flush_pool.map(_flush_one, _flush_tasks))
+            _flush_wall = time.time() - t_flush
+            _flush_bytes = sum(r[0] for r in _flush_results)
+            print(f"  [Shard flush sync] {len(_flush_tasks)} shard-files "
+                  f"({len(x_shard_edges)} X-shards x {_n_c} C) in "
+                  f"{_flush_wall:.2f}s bytes={_flush_bytes/1e9:.2f} GB "
+                  f"agg={_flush_bytes/_flush_wall/1e9:.2f} GB/s "
+                  f"pool={_flush_pool_size}")
+        _SHARD_BATCH["buf"] = None
+        _SHARD_BATCH["y0"] = None
+        _SHARD_BATCH["y1"] = None
+        _SHARD_BATCH["enabled"] = False
     t_drain_elapsed = time.time() - t_drain_start
     print(f"  [Write drain] Waited {t_drain_elapsed:.2f}s for {len(_write_futures)} background writes"
           f"{f' ({n_failed} failed)' if n_failed else ''}")
+    _ws = _WRITE_STATS
+    if _ws["n"] > 0:
+        print(f"  [Write stats] n={_ws['n']} total_wall={_ws['total_s']:.1f}s "
+              f"avg={_ws['total_s']/_ws['n']*1000:.1f}ms "
+              f"bytes={_ws['total_bytes']/1e9:.2f} GB "
+              f"agg_throughput={_ws['total_bytes']/_ws['total_s']/1e9:.2f} GB/s "
+              f"max_inflight={_ws['max_inflight']} (workers={_write_max_workers})")
 
     if block_hook is not None and hasattr(block_hook, "finalize"):
         block_hook.finalize()
