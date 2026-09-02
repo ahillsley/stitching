@@ -1,6 +1,5 @@
 # scripts to take the place of biahub-register
 
-import dexpv2
 import numpy as np
 from numpy.typing import ArrayLike
 import yaml
